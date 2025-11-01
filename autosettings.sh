@@ -1062,57 +1062,71 @@ step_bbr3_install() {
 
 # Функция выбора начального шага
 select_start_step() {
-  cls
-  print_header "Выбор начального шага"
-  echo "Выберите с какого шага начать выполнение:"
-  echo
-  echo "  1) Hostname и часовой пояс"
-  echo "  2) Настройка SSH"
-  echo "  3) Создание sudo-пользователя"
-  echo "  4) Обновление системы"
-  echo "  5) Настройка swap"
-  echo "  6) Базовые компоненты и Docker"
-  echo "  7) Fail2Ban"
-  echo "  8) Автообновления"
-  echo "  9) Логи journald"
-  echo " 10) Кастомный MOTD"
-  echo " 11) Оптимизации системы"
-  echo " 12) Дополнительные SSH настройки"
-  echo " 13) Установка BBR3"
-  echo
-  echo "  0) Выполнить все шаги с начала"
-  echo
+  # Отключаем строгий режим внутри функции для безопасности
+  set +e
+  
+  cls || true
+  print_header "Выбор начального шага" || true
+  echo "Выберите с какого шага начать выполнение:" || true
+  echo || true
+  echo "  1) Hostname и часовой пояс" || true
+  echo "  2) Настройка SSH" || true
+  echo "  3) Создание sudo-пользователя" || true
+  echo "  4) Обновление системы" || true
+  echo "  5) Настройка swap" || true
+  echo "  6) Базовые компоненты и Docker" || true
+  echo "  7) Fail2Ban" || true
+  echo "  8) Автообновления" || true
+  echo "  9) Логи journald" || true
+  echo " 10) Кастомный MOTD" || true
+  echo " 11) Оптимизации системы" || true
+  echo " 12) Дополнительные SSH настройки" || true
+  echo " 13) Установка BBR3" || true
+  echo || true
+  echo "  0) Выполнить все шаги с начала" || true
+  echo || true
   
   local start_step=""
   while true; do
-    echo -n "Введите номер шага (0-13) [0]: "
-    # Используем set +e для read, чтобы избежать завершения скрипта при ошибке ввода
-    set +e
+    echo -n "Введите номер шага (0-13) [0]: " >&2
     read -r start_step
     local read_rc=$?
-    set -e
     
     # Если read завершился с ошибкой (например, EOF), используем значение по умолчанию
     if [[ $read_rc -ne 0 ]]; then
-      start_step=0
       echo "0"
       return 0
     fi
     
     # Если пустой ввод - используем 0 (все шаги)
     if [[ -z "$start_step" ]]; then
-      start_step=0
+      echo "0"
+      return 0
     fi
     
-    # Убираем пробелы в начале и конце
-    start_step="${start_step#"${start_step%%[![:space:]]*}"}"
-    start_step="${start_step%"${start_step##*[![:space:]]}"}"
+    # Убираем пробелы в начале и конце (защищённая версия)
+    start_step=$(echo "$start_step" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' 2>/dev/null || echo "$start_step")
     
-    if [[ "$start_step" =~ ^[0-9]+$ ]] && (( start_step >= 0 && start_step <= 13 )); then
-      echo "$start_step"
-      return 0
+    # Извлекаем только цифры из ввода (на случай если пользователь ввёл "0." или "1," и т.д.)
+    local numeric_only=""
+    numeric_only=$(echo "$start_step" | grep -oE '^[0-9]+' 2>/dev/null || echo "")
+    
+    # Если есть цифры, используем их
+    if [[ -n "$numeric_only" ]]; then
+      start_step="$numeric_only"
+    fi
+    
+    # Проверяем что значение является числом и в допустимом диапазоне
+    if [[ "$start_step" =~ ^[0-9]+$ ]]; then
+      # Безопасная проверка диапазона
+      if (( start_step >= 0 && start_step <= 13 )) 2>/dev/null; then
+        echo "$start_step"
+        return 0
+      else
+        echo "⚠ Неверный номер. Введите число от 0 до 13." >&2
+      fi
     else
-      echo "⚠ Неверный номер. Введите число от 0 до 13."
+      echo "⚠ Неверный номер. Введите число от 0 до 13." >&2
     fi
   done
 }
@@ -1144,20 +1158,41 @@ main() {
   local select_rc=$?
   set -e
   
-  # Если функция не вернула значение, используем значение по умолчанию
+  # Если функция не вернула значение или завершилась с ошибкой, используем значение по умолчанию
   if [[ -z "$start_step" ]] || [[ $select_rc -ne 0 ]]; then
-    log_action "ПРЕДУПРЕЖДЕНИЕ: Ошибка при выборе шага, используется значение по умолчанию (0)"
+    log_action "ПРЕДУПРЕЖДЕНИЕ: Ошибка при выборе шага (rc=$select_rc), используется значение по умолчанию (0)"
+    start_step=0
+  fi
+  
+  # Убираем лишние символы и пробелы из значения
+  set +e
+  start_step=$(echo "$start_step" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | grep -oE '^[0-9]+' || echo "0")
+  set -e
+  
+  # Если значение пустое после очистки, используем 0
+  if [[ -z "$start_step" ]]; then
     start_step=0
   fi
   
   # Преобразуем в число для безопасного сравнения
   # Проверяем что значение является числом перед преобразованием
   if [[ "$start_step" =~ ^[0-9]+$ ]]; then
-    start_step=$((start_step + 0))
+    set +e
+    start_step=$((start_step + 0)) || start_step=0
+    set -e
   else
     log_action "ПРЕДУПРЕЖДЕНИЕ: Неверное значение шага '$start_step', используется значение по умолчанию (0)"
     start_step=0
   fi
+  
+  # Финальная проверка диапазона
+  set +e
+  if ! (( start_step >= 0 && start_step <= 13 )) 2>/dev/null; then
+    set -e
+    log_action "ПРЕДУПРЕЖДЕНИЕ: Значение шага $start_step вне диапазона, используется 0"
+    start_step=0
+  fi
+  set -e
   
   if [[ $start_step -eq 0 ]]; then
     echo "Выполнение всех шагов с начала."
