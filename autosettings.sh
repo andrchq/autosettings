@@ -127,25 +127,40 @@ print_info() {
 
 ask_yesno() {
   local prompt="$1"
-  local default="${2:-y}"  # По умолчанию "да" (Enter = да)
+  local default="${2:-y}"  # По умолчанию "да"
   
-  while true; do
-    if [[ "$default" == "y" ]]; then
-      echo -n "$prompt [Y/n] (Enter = да): "
-    else
-      echo -n "$prompt [y/N] (Enter = нет): "
+  # Проверяем доступность whiptail
+  if command -v whiptail >/dev/null 2>&1; then
+    local default_button=""
+    if [[ "$default" == "n" ]]; then
+      default_button="--defaultno"
     fi
-    read -r answer
     
-    # Если пустой ответ - используем значение по умолчанию
-    [[ -z "$answer" ]] && answer="$default"
-    
-    case "$answer" in
-      [Yy]|[Yy][Ee][Ss]) return 0 ;;
-      [Nn]|[Nn][Oo]) return 1 ;;
-      *) echo "Пожалуйста, введите y или n (или нажмите Enter для значения по умолчанию)" ;;
-    esac
-  done
+    if whiptail --title "Подтверждение" --yesno "$prompt" $default_button 10 60 3>&1 1>&2 2>&3; then
+      return 0
+    else
+      return 1
+    fi
+  else
+    # Fallback на терминальный ввод если whiptail недоступен
+    while true; do
+      if [[ "$default" == "y" ]]; then
+        echo -n "$prompt [Y/n] (Enter = да): "
+      else
+        echo -n "$prompt [y/N] (Enter = нет): "
+      fi
+      read -r answer
+      
+      # Если пустой ответ - используем значение по умолчанию
+      [[ -z "$answer" ]] && answer="$default"
+      
+      case "$answer" in
+        [Yy]|[Yy][Ee][Ss]) return 0 ;;
+        [Nn]|[Nn][Oo]) return 1 ;;
+        *) echo "Пожалуйста, введите y или n (или нажмите Enter для значения по умолчанию)" ;;
+      esac
+    done
+  fi
 }
 
 ask_input() {
@@ -153,23 +168,58 @@ ask_input() {
   local default="${2:-}"
   local var_name="${3:-}"
   
-  if [[ -n "$default" ]]; then
-    echo -n "$prompt [$default]: "
+  # Проверяем доступность whiptail
+  if command -v whiptail >/dev/null 2>&1; then
+    local result=""
+    local exit_code=0
+    
+    if [[ -n "$default" ]]; then
+      result=$(whiptail --title "Ввод данных" --inputbox "$prompt" 10 60 "$default" 3>&1 1>&2 2>&3)
+      exit_code=$?
+    else
+      result=$(whiptail --title "Ввод данных" --inputbox "$prompt" 10 60 "" 3>&1 1>&2 2>&3)
+      exit_code=$?
+    fi
+    
+    # Если пользователь нажал Cancel или ESC, используем значение по умолчанию если есть
+    if [[ $exit_code -ne 0 ]]; then
+      if [[ -n "$default" ]]; then
+        result="$default"
+      else
+        result=""
+      fi
+    fi
+    
+    # Если результат пустой и есть значение по умолчанию - используем его
+    if [[ -z "$result" ]] && [[ -n "$default" ]]; then
+      result="$default"
+    fi
+    
+    if [[ -n "$var_name" ]]; then
+      eval "$var_name=\"$result\""
+    else
+      echo "$result"
+    fi
   else
-    echo -n "$prompt: "
-  fi
-  
-  read -r answer
-  
-  # Если пустой ответ и есть значение по умолчанию - используем его
-  if [[ -z "$answer" ]] && [[ -n "$default" ]]; then
-    answer="$default"
-  fi
-  
-  if [[ -n "$var_name" ]]; then
-    eval "$var_name=\"$answer\""
-  else
-    echo "$answer"
+    # Fallback на терминальный ввод если whiptail недоступен
+    if [[ -n "$default" ]]; then
+      echo -n "$prompt [$default]: "
+    else
+      echo -n "$prompt: "
+    fi
+    
+    read -r answer
+    
+    # Если пустой ответ и есть значение по умолчанию - используем его
+    if [[ -z "$answer" ]] && [[ -n "$default" ]]; then
+      answer="$default"
+    fi
+    
+    if [[ -n "$var_name" ]]; then
+      eval "$var_name=\"$answer\""
+    else
+      echo "$answer"
+    fi
   fi
 }
 
@@ -441,8 +491,14 @@ step_ssh_hardening() {
     return 0
   fi
 
-  echo "Вставь публичный SSH-ключ (ssh-ed25519/ssh-rsa...):"
-  read -r pubkey
+  # Ввод SSH ключа через whiptail
+  if command -v whiptail >/dev/null 2>&1; then
+    pubkey=$(whiptail --title "SSH ключ" --inputbox "Вставь публичный SSH-ключ (ssh-ed25519/ssh-rsa...):" 12 80 "" 3>&1 1>&2 2>&3)
+    [[ $? -ne 0 ]] && pubkey=""
+  else
+    echo "Вставь публичный SSH-ключ (ssh-ed25519/ssh-rsa...):"
+    read -r pubkey
+  fi
   [[ -z "$pubkey" ]] && { echo "⚠ Ключ не задан. Пропуск."; return 0; }
   if ! validate_ssh_key "$pubkey"; then
     echo "⚠ Неверный формат ключа. Ожидается: ssh-ed25519/ssh-rsa/ecdsa-sha2... Пропуск."
@@ -495,8 +551,14 @@ step_create_user() {
     return 0
   fi
   
-  echo "Вставь публичный SSH-ключ для пользователя (можно оставить пустым):"
-  read -r pubkey_user
+  # Ввод SSH ключа для пользователя через whiptail
+  if command -v whiptail >/dev/null 2>&1; then
+    pubkey_user=$(whiptail --title "SSH ключ для пользователя" --inputbox "Вставь публичный SSH-ключ для пользователя (можно оставить пустым):" 12 80 "" 3>&1 1>&2 2>&3)
+    [[ $? -ne 0 ]] && pubkey_user=""
+  else
+    echo "Вставь публичный SSH-ключ для пользователя (можно оставить пустым):"
+    read -r pubkey_user
+  fi
   
   if retry_on_error "Создание пользователя" spinner "Создаю пользователя $username" bash -c "
     useradd -m -s /bin/bash \"$username\"
@@ -1029,11 +1091,92 @@ check_system_integrity() {
   log_action "Проверка целостности: ${#issues[@]} ошибок, ${#warnings[@]} предупреждений"
   cls
   print_header "Проверка целостности системы"
-  echo -e "$report"
-  echo
-  read -p "Нажмите Enter для продолжения..."
+  
+  # Показываем отчёт через whiptail или терминал
+  if command -v whiptail >/dev/null 2>&1; then
+    whiptail --title "Проверка целостности системы" --msgbox "$report" 20 80
+  else
+    echo -e "$report"
+    echo
+    read -p "Нажмите Enter для продолжения..."
+  fi
   
   return ${#issues[@]}
+}
+
+# Функция выбора начального шага через whiptail
+select_start_step() {
+  local start_step=0
+  
+  # Проверяем доступность whiptail
+  if command -v whiptail >/dev/null 2>&1; then
+    start_step=$(whiptail --title "Выбор начального шага" \
+      --menu "Выберите с какого шага начать выполнение:" \
+      20 60 14 \
+      "0" "Выполнить все шаги с начала" \
+      "1" "Hostname и часовой пояс" \
+      "2" "Настройка SSH" \
+      "3" "Создание sudo-пользователя" \
+      "4" "Обновление системы" \
+      "5" "Настройка swap" \
+      "6" "Базовые компоненты и Docker" \
+      "7" "Fail2Ban" \
+      "8" "Автообновления" \
+      "9" "Логи journald" \
+      "10" "Кастомный MOTD" \
+      "11" "Оптимизации системы" \
+      "12" "Дополнительные SSH настройки" \
+      "13" "Установка BBR3" \
+      3>&1 1>&2 2>&3)
+    
+    # Если пользователь нажал Cancel или ESC, используем значение по умолчанию (0)
+    if [[ $? -ne 0 ]] || [[ -z "$start_step" ]]; then
+      start_step=0
+    fi
+  else
+    # Fallback на терминальный ввод если whiptail недоступен
+    cls
+    print_header "Выбор начального шага"
+    echo "Выберите с какого шага начать выполнение:"
+    echo
+    echo "  1) Hostname и часовой пояс"
+    echo "  2) Настройка SSH"
+    echo "  3) Создание sudo-пользователя"
+    echo "  4) Обновление системы"
+    echo "  5) Настройка swap"
+    echo "  6) Базовые компоненты и Docker"
+    echo "  7) Fail2Ban"
+    echo "  8) Автообновления"
+    echo "  9) Логи journald"
+    echo " 10) Кастомный MOTD"
+    echo " 11) Оптимизации системы"
+    echo " 12) Дополнительные SSH настройки"
+    echo " 13) Установка BBR3"
+    echo
+    echo "  0) Выполнить все шаги с начала"
+    echo
+    
+    while true; do
+      echo -n "Введите номер шага (0-13) [0]: "
+      set +e
+      read -r start_step
+      set -e
+      
+      [[ -z "$start_step" ]] && start_step=0
+      
+      if [[ "$start_step" =~ ^[0-9]+$ ]] && (( start_step >= 0 && start_step <= 13 )); then
+        break
+      else
+        echo "⚠ Неверный номер. Введите число от 0 до 13."
+      fi
+    done
+  fi
+  
+  # Преобразуем в число
+  start_step=$((start_step + 0))
+  
+  echo "$start_step"
+  return 0
 }
 
 # --- Шаг 13/13: Установка BBR3 ---
@@ -1115,6 +1258,15 @@ main() {
   # Устанавливаем обработчик Ctrl+C - требуется 3 нажатия для завершения
   trap 'handle_ctrl_c' INT
   
+  # Проверяем и устанавливаем whiptail для интерактивных окон
+  if ! command -v whiptail >/dev/null 2>&1; then
+    log_action "Установка whiptail для интерактивных окон"
+    set +e
+    apt-get update -qq >/dev/null 2>&1
+    apt-get install -y whiptail >/dev/null 2>&1
+    set -e
+  fi
+  
   init_logging
   init_backup_dir
   log_action "Инициализация: логи в $LOG_FILE, резервные копии в $BACKUP_DIR"
@@ -1127,13 +1279,43 @@ main() {
   echo
   echo "⚠ Защита от случайного завершения: для остановки скрипта нажмите Ctrl+C 3 раза"
   echo
-  echo "Выполнение всех шагов с начала."
-  echo
   
-  # Защита read от ошибок
+  # Выбор начального шага
+  local start_step=""
   set +e
-  read -p "Нажмите Enter для продолжения..."
+  start_step=$(select_start_step)
   set -e
+  
+  # Если функция не вернула значение, используем значение по умолчанию
+  if [[ -z "$start_step" ]]; then
+    start_step=0
+  fi
+  
+  # Преобразуем в число
+  start_step=$((start_step + 0))
+  
+  # Показываем сообщение о выбранном шаге
+  if [[ $start_step -eq 0 ]]; then
+    if command -v whiptail >/dev/null 2>&1; then
+      whiptail --title "Готов к запуску" --msgbox "Выполнение всех шагов с начала.\n\nНажмите OK для продолжения." 10 60
+    else
+      echo "Выполнение всех шагов с начала."
+      echo
+      set +e
+      read -p "Нажмите Enter для продолжения..."
+      set -e
+    fi
+  else
+    if command -v whiptail >/dev/null 2>&1; then
+      whiptail --title "Готов к запуску" --msgbox "Начинаю выполнение с шага $start_step.\n\nНажмите OK для продолжения." 10 60
+    else
+      echo "Начинаю выполнение с шага $start_step."
+      echo
+      set +e
+      read -p "Нажмите Enter для продолжения..."
+      set -e
+    fi
+  fi
   
   # Проверка интернета (предупреждение, но не блокируем)
   if ! check_internet; then
@@ -1147,35 +1329,63 @@ main() {
     fi
   fi
 
-  # Проверка системных требований
-  check_system_prerequisites
+  # Проверка системных требований (только если начинаем с начала)
+  if [[ $start_step -le 1 ]]; then
+    check_system_prerequisites
+  fi
   
-  log_action "Начало выполнения всех шагов мастера"
+  log_action "Начало выполнения шагов мастера с шага $start_step"
   
-  # Выполняем все шаги последовательно
-  step_hostname_tz;            cls
-  step_ssh_hardening;          cls
-  step_create_user;            cls
-  step_updates_now;            cls
-  step_configure_swap;         cls
-  step_components;             cls
-  step_fail2ban_basic;         cls
-  step_unattended;             cls
-  step_journald_limits;        cls
-  step_motd_custom;            cls
+  # Выполняем шаги в зависимости от выбранного начального шага
+  if [[ $start_step -le 1 ]]; then
+    step_hostname_tz;            cls
+  fi
+  if [[ $start_step -le 2 ]]; then
+    step_ssh_hardening;          cls
+  fi
+  if [[ $start_step -le 3 ]]; then
+    step_create_user;            cls
+  fi
+  if [[ $start_step -le 4 ]]; then
+    step_updates_now;            cls
+  fi
+  if [[ $start_step -le 5 ]]; then
+    step_configure_swap;         cls
+  fi
+  if [[ $start_step -le 6 ]]; then
+    step_components;             cls
+  fi
+  if [[ $start_step -le 7 ]]; then
+    step_fail2ban_basic;         cls
+  fi
+  if [[ $start_step -le 8 ]]; then
+    step_unattended;             cls
+  fi
+  if [[ $start_step -le 9 ]]; then
+    step_journald_limits;        cls
+  fi
+  if [[ $start_step -le 10 ]]; then
+    step_motd_custom;            cls
+  fi
+  if [[ $start_step -le 11 ]]; then
+    # Шаг 11 выполняется с дополнительной защитой от завершения
+    set +e
+    step_sysctl_unlimit || true
+    set -e
+    cls
+  fi
+  if [[ $start_step -le 12 ]]; then
+    step_ssh_additional_hardening; cls
+  fi
   
-  # Шаг 11 выполняется с дополнительной защитой от завершения
-  set +e
-  step_sysctl_unlimit || true
-  set -e
-  cls
+  # Проверка целостности перед завершением (только если не пропустили шаги)
+  if [[ $start_step -le 12 ]]; then
+    check_system_integrity
+  fi
   
-  step_ssh_additional_hardening; cls
-  
-  # Проверка целостности перед завершением
-  check_system_integrity
-  
-  step_bbr3_install
+  if [[ $start_step -le 13 ]]; then
+    step_bbr3_install
+  fi
   
   log_action "=== Завершение autosettings.sh $(date) ==="
   local duration=$(( $(date +%s) - SCRIPT_START_TIME ))
