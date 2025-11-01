@@ -9,6 +9,10 @@ readonly LOG_FILE="/var/log/autosettings.log"
 readonly BACKUP_DIR="/root/autosettings_backup_$(date +%Y%m%d_%H%M%S)"
 readonly SCRIPT_START_TIME=$(date +%s)
 
+# Счётчик нажатий Ctrl+C
+CTRL_C_COUNT=0
+readonly CTRL_C_REQUIRED=3
+
 # Инициализация логирования и резервного копирования
 init_logging() {
   mkdir -p "$(dirname "$LOG_FILE")"
@@ -25,6 +29,26 @@ init_backup_dir() {
 
 log_action() {
   echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" >> "$LOG_FILE"
+}
+
+# Обработчик Ctrl+C - требует 3 нажатия для завершения
+handle_ctrl_c() {
+  ((CTRL_C_COUNT++))
+  
+  echo
+  echo "⚠ Предупреждение: Обнаружено нажатие Ctrl+C ($CTRL_C_COUNT/$CTRL_C_REQUIRED)"
+  
+  if [[ $CTRL_C_COUNT -ge $CTRL_C_REQUIRED ]]; then
+    echo
+    echo "❌ Скрипт завершён по запросу пользователя (3 нажатия Ctrl+C)"
+    log_action "Скрипт завершён пользователем (Ctrl+C x$CTRL_C_COUNT)"
+    exit 130
+  else
+    local remaining=$((CTRL_C_REQUIRED - CTRL_C_COUNT))
+    echo "Для завершения скрипта нажмите Ctrl+C ещё $remaining раз(а)"
+    echo "Продолжаю выполнение..."
+    echo
+  fi
 }
 
 check_internet() {
@@ -446,7 +470,20 @@ step_updates_now() {
     return 0
   fi
   
-  if retry_on_error "Обновление системы" spinner "Обновляю систему" bash -c "apt-get update -y && DEBIAN_FRONTEND=noninteractive apt-get -y full-upgrade"; then
+  if retry_on_error "Обновление системы" spinner "Обновляю систему" bash -c "
+    export DEBIAN_FRONTEND=noninteractive
+    export UCF_FORCE_CONFFNEW=1
+    
+    apt-get update -y
+    
+    # Сначала исправляем сломанные пакеты если есть
+    apt-get install -f -y -o Dpkg::Options::='--force-confdef' -o Dpkg::Options::='--force-confold' || true
+    
+    # Обновление с автоматической обработкой конфигурационных файлов
+    # --force-confdef: использовать версию по умолчанию (обычно сохраняет текущую)
+    # --force-confold: сохранять текущую версию конфигурации
+    apt-get -y full-upgrade -o Dpkg::Options::='--force-confdef' -o Dpkg::Options::='--force-confold'
+  "; then
     echo "✓ Готово: Система обновлена."
   fi
 }
@@ -936,6 +973,10 @@ step_bbr3_install_and_exit() {
 
 main() {
   require_root
+  
+  # Устанавливаем обработчик Ctrl+C - требуется 3 нажатия для завершения
+  trap 'handle_ctrl_c' INT
+  
   init_logging
   init_backup_dir
   log_action "Инициализация: логи в $LOG_FILE, резервные копии в $BACKUP_DIR"
@@ -945,6 +986,8 @@ main() {
   echo "Интерактивный мастер. После каждого шага — очистка экрана."
   echo "Логи: $LOG_FILE"
   echo "Резервные копии: $BACKUP_DIR"
+  echo
+  echo "⚠ Защита от случайного завершения: для остановки скрипта нажмите Ctrl+C 3 раза"
   echo
   read -p "Нажмите Enter для продолжения..."
   
