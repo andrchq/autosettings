@@ -75,7 +75,7 @@ check_system_prerequisites() {
       echo "  • $issue"
     done
     echo
-    if ! ask_yesno "Продолжить выполнение?" "n"; then
+    if ! ask_yesno "Продолжить выполнение?" "y"; then
       log_action "Пользователь отменил выполнение из-за проблем с системой"
       exit 0
     fi
@@ -103,13 +103,13 @@ print_info() {
 
 ask_yesno() {
   local prompt="$1"
-  local default="${2:-n}"  # По умолчанию "нет"
+  local default="${2:-y}"  # По умолчанию "да" (Enter = да)
   
   while true; do
     if [[ "$default" == "y" ]]; then
-      echo -n "$prompt [Y/n]: "
+      echo -n "$prompt [Y/n] (Enter = да): "
     else
-      echo -n "$prompt [y/N]: "
+      echo -n "$prompt [y/N] (Enter = нет): "
     fi
     read -r answer
     
@@ -119,7 +119,7 @@ ask_yesno() {
     case "$answer" in
       [Yy]|[Yy][Ee][Ss]) return 0 ;;
       [Nn]|[Nn][Oo]) return 1 ;;
-      *) echo "Пожалуйста, введите y или n" ;;
+      *) echo "Пожалуйста, введите y или n (или нажмите Enter для значения по умолчанию)" ;;
     esac
   done
 }
@@ -316,22 +316,16 @@ step_hostname_tz() {
   cls
   print_header "Шаг 1/13 — Имя сервера и часовой пояс"
   
-  if ! ask_yesno "Установить hostname и часовой пояс?" "y"; then
+  if ! ask_yesno "Установить hostname и часовой пояс (Europe/Moscow)?" "y"; then
     return 0
   fi
   
   ask_input "Введи hostname (например, prst-srv-01)" "" "new_hostname"
   [[ -z "$new_hostname" ]] && { echo "⚠ Пустое имя — пропуск."; return 0; }
 
-  # Выбор часового пояса
-  ask_input "Введи часовой пояс (например, Europe/Moscow, Europe/Kiev, Asia/Almaty)" "Europe/Moscow" "timezone"
-  [[ -z "$timezone" ]] && timezone="Europe/Moscow"
-  
-  # Проверка валидности часового пояса
-  if ! timedatectl list-timezones | grep -qxF "$timezone"; then
-    echo "⚠ Неверный часовой пояс. Используется Europe/Moscow."
-    timezone="Europe/Moscow"
-  fi
+  # Часовой пояс всегда Europe/Moscow
+  local timezone="Europe/Moscow"
+  echo "Часовой пояс: $timezone (по умолчанию)"
 
   if retry_on_error "Установка hostname и часового пояса" spinner "Устанавливаю hostname и часовой пояс" bash -c "
     backup_file /etc/hostname
@@ -462,25 +456,66 @@ step_configure_swap() {
   cls
   print_header "Шаг 5/13 — Настройка swap"
   
-  if ! ask_yesno "Настроить swap-файл (рекомендуется если swap отсутствует)?" "y"; then
-    return 0
-  fi
-  
   # Проверяем существующий swap
-  local swap_total
+  local swap_total swap_used swap_free
   swap_total=$(free -m | awk '/^Swap:/{print $2}')
+  swap_used=$(free -m | awk '/^Swap:/{print $3}')
+  swap_free=$(free -m | awk '/^Swap:/{print $4}')
   
   if [[ $swap_total -gt 0 ]]; then
-    echo "⚠ Обнаружен существующий swap (${swap_total}MB)"
-    if ! ask_yesno "Продолжить настройку?" "n"; then
+    echo "✓ Обнаружен существующий swap:"
+    echo "  Всего: ${swap_total}MB"
+    echo "  Используется: ${swap_used}MB"
+    echo "  Свободно: ${swap_free}MB"
+    echo
+    
+    # Проверяем источник swap (файл или раздел)
+    local swap_source=""
+    if [[ -f /swapfile ]]; then
+      local swapfile_size
+      swapfile_size=$(du -m /swapfile 2>/dev/null | awk '{print $1}')
+      swap_source="файл /swapfile (${swapfile_size}MB)"
+    elif swapon --show 2>/dev/null | grep -qE "(TYPE|partition)"; then
+      swap_source="раздел диска"
+    else
+      swap_source="файл или раздел (автоопределение)"
+    fi
+    echo "  Источник: $swap_source"
+    echo
+    
+    if ! ask_yesno "Перенастроить swap?" "n"; then
+      echo "Пропуск настройки swap."
+      return 0
+    fi
+  else
+    echo "⚠ Swap не настроен."
+    echo "Рекомендуется настроить swap для стабильной работы системы."
+    echo
+    
+    if ! ask_yesno "Настроить swap-файл?" "y"; then
+      echo "Пропуск настройки swap."
       return 0
     fi
   fi
   
-  ask_input "Размер swap в MB (рекомендуется: размер RAM или 2048)" "2048" "swap_size_mb"
+  # Определяем рекомендуемый размер на основе RAM
+  local ram_total
+  ram_total=$(free -m | awk '/^Mem:/{print $2}')
+  local recommended_swap=$ram_total
+  if [[ $recommended_swap -lt 2048 ]]; then
+    recommended_swap=2048
+  elif [[ $recommended_swap -gt 8192 ]]; then
+    recommended_swap=8192
+  fi
+  
+  echo "Размер RAM: ${ram_total}MB"
+  echo "Рекомендуемый размер swap: ${recommended_swap}MB"
+  echo
+  
+  ask_input "Размер swap в MB (рекомендуется: ${recommended_swap})" "$recommended_swap" "swap_size_mb"
   if ! [[ "$swap_size_mb" =~ ^[0-9]+$ ]] || (( swap_size_mb < 256 || swap_size_mb > 16384 )); then
-    echo "⚠ Неверный размер (256-16384 MB). Используется 2048MB."
-    swap_size_mb=2048
+    echo "⚠ Неверный размер (256-16384 MB). Используется ${recommended_swap}MB."
+    swap_size_mb=$recommended_swap
   fi
   
   if retry_on_error "Настройка swap" spinner "Настраиваю swap-файл ${swap_size_mb}MB" bash -c "
@@ -490,24 +525,27 @@ step_configure_swap() {
     # Удаляем старый swap-файл если есть
     [[ -f /swapfile ]] && rm -f /swapfile
     
+    # Удаляем старую запись из fstab если есть
+    backup_file /etc/fstab
+    sed -i '/\\/swapfile/d' /etc/fstab
+    
     # Создаём новый swap-файл
     dd if=/dev/zero of=/swapfile bs=1M count=$swap_size_mb status=progress
     chmod 600 /swapfile
     mkswap /swapfile
     swapon /swapfile
     
-    # Добавляем в fstab если ещё нет
-    if ! grep -q '/swapfile' /etc/fstab; then
-      backup_file /etc/fstab
-      echo '/swapfile none swap sw 0 0' >> /etc/fstab
-    fi
+    # Добавляем в fstab
+    echo '/swapfile none swap sw 0 0' >> /etc/fstab
     
     # Настраиваем swappiness (оптимально 10 для серверов)
     backup_file /etc/sysctl.conf
     if ! grep -q '^vm.swappiness=' /etc/sysctl.conf; then
       echo 'vm.swappiness=10' >> /etc/sysctl.conf
-      sysctl vm.swappiness=10
+    else
+      sed -i 's/^vm.swappiness=.*/vm.swappiness=10/' /etc/sysctl.conf
     fi
+    sysctl vm.swappiness=10
   "; then
     local new_swap
     new_swap=$(free -m | awk '/^Swap:/{print $2}')
@@ -916,7 +954,7 @@ main() {
     echo
     print_header "⚠ ПРЕДУПРЕЖДЕНИЕ"
     echo "Обнаружены проблемы с подключением к интернету."
-    if ! ask_yesno "Продолжить выполнение?" "n"; then
+    if ! ask_yesno "Продолжить выполнение?" "y"; then
       log_action "Пользователь отменил выполнение из-за отсутствия интернета"
       exit 0
     fi
