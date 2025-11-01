@@ -309,9 +309,9 @@ safe_remote_script() {
   local tmp_script="/tmp/remote_script_$(date +%s).sh"
   echo "$script_content" > "$tmp_script"
   
-  # Заменяем все exit на return, чтобы не завершать основной скрипт
+  # Заменяем все exit и exec на return, чтобы не завершать основной скрипт
   # Это критично для предотвращения завершения основного скрипта
-  # Используем множественные замены для всех вариантов exit
+  # Используем множественные замены для всех вариантов exit и exec
   sed -i 's/^[[:space:]]*exit[[:space:]]*$/return 0/g' "$tmp_script"
   sed -i 's/exit 0/return 0/g' "$tmp_script"
   sed -i 's/exit 1/return 1/g' "$tmp_script"
@@ -319,6 +319,8 @@ safe_remote_script() {
   sed -i 's/exit 3/return 3/g' "$tmp_script"
   sed -i 's/exit \$?/return $?/g' "$tmp_script"
   sed -i 's/exit $?/return $?/g' "$tmp_script"
+  # Заменяем exec на return (exec может заменить процесс)
+  sed -i 's/^[[:space:]]*exec[[:space:]]/return 0 # exec replaced /g' "$tmp_script"
   # Заменяем exit с любым числом (цикл для чисел 0-255)
   for i in {0..255}; do
     sed -i "s/exit $i/return $i/g" "$tmp_script"
@@ -327,36 +329,52 @@ safe_remote_script() {
   sed -i 's/exit[[:space:]]*$/return 0/g' "$tmp_script"
   
   chmod +x "$tmp_script"
-  log_action "Скрипт сохранён: $tmp_script (exit заменён на return)"
+  log_action "Скрипт сохранён: $tmp_script (exit и exec заменены на return)"
   
   # Выполняем с обработкой ошибок и stdin при необходимости
   # Сохраняем вывод в лог, но также показываем пользователю
-  # Важно: выполняем в подпроцессе с явной обработкой ошибок
+  # КРИТИЧНО: Выполняем через полностью изолированный shell-процесс
+  # Используем bash -c с оберткой, которая гарантирует возврат управления
   local output_file="/tmp/remote_script_output_$(date +%s)"
   local rc=0
   
-  # Обёртка для выполнения скрипта - предотвращает завершение основного скрипта
-  # Используем подпроцесс () с явной обработкой, чтобы exit из внешнего скрипта не завершал основной
-  # Также запускаем в отдельном shell-процессе для полной изоляции
+  # Создаём обёрточный скрипт, который гарантирует возврат управления
+  local wrapper_script="/tmp/wrapper_$(date +%s).sh"
+  cat > "$wrapper_script" <<'WRAPPER_EOF'
+#!/bin/bash
+set +e
+SCRIPT_PATH="$1"
+OUTPUT_FILE="$2"
+STDIN_INPUT="$3"
+
+if [[ -n "$STDIN_INPUT" ]]; then
+  echo "$STDIN_INPUT" | bash "$SCRIPT_PATH" > "$OUTPUT_FILE" 2>&1
+  EXIT_CODE=$?
+else
+  bash "$SCRIPT_PATH" > "$OUTPUT_FILE" 2>&1
+  EXIT_CODE=$?
+fi
+
+# Гарантируем возврат кода выхода, но не завершаем родительский процесс
+exit $EXIT_CODE
+WRAPPER_EOF
+  chmod +x "$wrapper_script"
+  
+  # Выполняем обёрточный скрипт в полностью изолированном процессе
+  # Используем команду bash -c в subshell для создания нового shell-процесса
+  # Это гарантирует, что даже если скрипт завершит процесс, родительский скрипт продолжит работу
   set +e
-  if [[ -n "$stdin_input" ]]; then
-    (
-      set +e
-      echo "$stdin_input" | bash "$tmp_script" > "$output_file" 2>&1
-      local script_rc=$?
-      set -e
-      exit $script_rc
-    ) 2>/dev/null || rc=$?
-  else
-    (
-      set +e
-      bash "$tmp_script" > "$output_file" 2>&1
-      local script_rc=$?
-      set -e
-      exit $script_rc
-    ) 2>/dev/null || rc=$?
-  fi
+  (
+    if [[ -n "$stdin_input" ]]; then
+      bash -c "bash \"$wrapper_script\" \"$tmp_script\" \"$output_file\" \"$stdin_input\"" 2>/dev/null
+    else
+      bash -c "bash \"$wrapper_script\" \"$tmp_script\" \"$output_file\" \"\"" 2>/dev/null
+    fi
+  ) || rc=$?
   set -e
+  
+  # Очищаем временные файлы
+  rm -f "$wrapper_script"
   
   # Показываем вывод и сохраняем в лог
   if [[ -f "$output_file" ]]; then
@@ -859,27 +877,33 @@ step_sysctl_unlimit() {
   # Выполняем первый скрипт с полной защитой от завершения
   echo "Выполняю sysctl_opt.sh..."
   set +e
-  if safe_remote_script "https://dignezzz.github.io/server/sysctl_opt.sh" "sysctl оптимизации"; then
-    ((success_count++))
-  fi
+  (
+    safe_remote_script "https://dignezzz.github.io/server/sysctl_opt.sh" "sysctl оптимизации"
+  ) && ((success_count++)) || true
   set -e
+  
+  # Явная проверка, что мы все еще в основном скрипте
+  log_action "Проверка после sysctl_opt.sh: скрипт продолжает работу"
   
   # Явно продолжаем выполнение после первого скрипта
   echo
-  echo "Продолжаю выполнение..."
+  echo "✓ Шаг 11 (часть 1) завершён. Продолжаю выполнение..."
   echo
   
   # Выполняем второй скрипт с полной защитой от завершения
   echo "Выполняю unlimit_server.sh..."
   set +e
-  if safe_remote_script "https://dignezzz.github.io/server/unlimit_server.sh" "unlimit оптимизации"; then
-    ((success_count++))
-  fi
+  (
+    safe_remote_script "https://dignezzz.github.io/server/unlimit_server.sh" "unlimit оптимизации"
+  ) && ((success_count++)) || true
   set -e
+  
+  # Явная проверка, что мы все еще в основном скрипте
+  log_action "Проверка после unlimit_server.sh: скрипт продолжает работу"
   
   # Явно продолжаем выполнение после второго скрипта
   echo
-  echo "Продолжаю выполнение..."
+  echo "✓ Шаг 11 (часть 2) завершён. Продолжаю выполнение..."
   echo
   
   if [[ $success_count -eq 2 ]]; then
@@ -892,7 +916,10 @@ step_sysctl_unlimit() {
   
   # Явное сообщение о продолжении работы скрипта
   echo
-  echo "Оптимизации завершены. Скрипт продолжает работу..."
+  echo "═══════════════════════════════════════"
+  echo "Шаг 11 завершён. Скрипт продолжает работу..."
+  echo "Переход к шагу 12..."
+  echo "═══════════════════════════════════════"
   sleep 2
   
   # Гарантируем возврат успешного кода, чтобы скрипт продолжал работу
