@@ -1083,12 +1083,30 @@ select_start_step() {
   echo "  0) Выполнить все шаги с начала"
   echo
   
+  local start_step=""
   while true; do
     echo -n "Введите номер шага (0-13) [0]: "
+    # Используем set +e для read, чтобы избежать завершения скрипта при ошибке ввода
+    set +e
     read -r start_step
+    local read_rc=$?
+    set -e
+    
+    # Если read завершился с ошибкой (например, EOF), используем значение по умолчанию
+    if [[ $read_rc -ne 0 ]]; then
+      start_step=0
+      echo "0"
+      return 0
+    fi
     
     # Если пустой ввод - используем 0 (все шаги)
-    [[ -z "$start_step" ]] && start_step=0
+    if [[ -z "$start_step" ]]; then
+      start_step=0
+    fi
+    
+    # Убираем пробелы в начале и конце
+    start_step="${start_step#"${start_step%%[![:space:]]*}"}"
+    start_step="${start_step%"${start_step##*[![:space:]]}"}"
     
     if [[ "$start_step" =~ ^[0-9]+$ ]] && (( start_step >= 0 && start_step <= 13 )); then
       echo "$start_step"
@@ -1119,8 +1137,27 @@ main() {
   echo
   
   # Выбор начального шага
-  local start_step
+  local start_step=""
+  # Защита от ошибок при вызове функции выбора шага
+  set +e
   start_step=$(select_start_step)
+  local select_rc=$?
+  set -e
+  
+  # Если функция не вернула значение, используем значение по умолчанию
+  if [[ -z "$start_step" ]] || [[ $select_rc -ne 0 ]]; then
+    log_action "ПРЕДУПРЕЖДЕНИЕ: Ошибка при выборе шага, используется значение по умолчанию (0)"
+    start_step=0
+  fi
+  
+  # Преобразуем в число для безопасного сравнения
+  # Проверяем что значение является числом перед преобразованием
+  if [[ "$start_step" =~ ^[0-9]+$ ]]; then
+    start_step=$((start_step + 0))
+  else
+    log_action "ПРЕДУПРЕЖДЕНИЕ: Неверное значение шага '$start_step', используется значение по умолчанию (0)"
+    start_step=0
+  fi
   
   if [[ $start_step -eq 0 ]]; then
     echo "Выполнение всех шагов с начала."
@@ -1128,7 +1165,11 @@ main() {
     echo "Начинаю выполнение с шага $start_step."
   fi
   echo
+  
+  # Защита read от ошибок
+  set +e
   read -p "Нажмите Enter для продолжения..."
+  set -e
   
   # Проверка интернета (предупреждение, но не блокируем)
   if ! check_internet; then
