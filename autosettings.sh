@@ -311,12 +311,20 @@ safe_remote_script() {
   
   # Заменяем все exit на return, чтобы не завершать основной скрипт
   # Это критично для предотвращения завершения основного скрипта
-  sed -i 's/^[[:space:]]*exit[[:space:]]/return /g' "$tmp_script"
-  sed -i 's/^[[:space:]]*exit$/return 0/g' "$tmp_script"
-  # Также заменяем exit в функциях и условиях
+  # Используем множественные замены для всех вариантов exit
+  sed -i 's/^[[:space:]]*exit[[:space:]]*$/return 0/g' "$tmp_script"
   sed -i 's/exit 0/return 0/g' "$tmp_script"
   sed -i 's/exit 1/return 1/g' "$tmp_script"
+  sed -i 's/exit 2/return 2/g' "$tmp_script"
+  sed -i 's/exit 3/return 3/g' "$tmp_script"
   sed -i 's/exit \$?/return $?/g' "$tmp_script"
+  sed -i 's/exit $?/return $?/g' "$tmp_script"
+  # Заменяем exit с любым числом (цикл для чисел 0-255)
+  for i in {0..255}; do
+    sed -i "s/exit $i/return $i/g" "$tmp_script"
+  done
+  # Также заменяем варианты с пробелами после exit
+  sed -i 's/exit[[:space:]]*$/return 0/g' "$tmp_script"
   
   chmod +x "$tmp_script"
   log_action "Скрипт сохранён: $tmp_script (exit заменён на return)"
@@ -329,16 +337,23 @@ safe_remote_script() {
   
   # Обёртка для выполнения скрипта - предотвращает завершение основного скрипта
   # Используем подпроцесс () с явной обработкой, чтобы exit из внешнего скрипта не завершал основной
+  # Также запускаем в отдельном shell-процессе для полной изоляции
   set +e
   if [[ -n "$stdin_input" ]]; then
     (
+      set +e
       echo "$stdin_input" | bash "$tmp_script" > "$output_file" 2>&1
-      exit $?
+      local script_rc=$?
+      set -e
+      exit $script_rc
     ) 2>/dev/null || rc=$?
   else
     (
+      set +e
       bash "$tmp_script" > "$output_file" 2>&1
-      exit $?
+      local script_rc=$?
+      set -e
+      exit $script_rc
     ) 2>/dev/null || rc=$?
   fi
   set -e
@@ -830,7 +845,7 @@ step_motd_custom() {
   fi
 }
 
-# --- Шаг 11/10: sysctl_opt.sh и unlimit_server.sh ---
+# --- Шаг 11/13: sysctl_opt.sh и unlimit_server.sh ---
 step_sysctl_unlimit() {
   cls
   print_header "Шаг 11/13 — Оптимизации системы"
@@ -841,22 +856,26 @@ step_sysctl_unlimit() {
   
   local success_count=0
   
-  # Выполняем первый скрипт
+  # Выполняем первый скрипт с полной защитой от завершения
   echo "Выполняю sysctl_opt.sh..."
+  set +e
   if safe_remote_script "https://dignezzz.github.io/server/sysctl_opt.sh" "sysctl оптимизации"; then
     ((success_count++))
   fi
+  set -e
   
   # Явно продолжаем выполнение после первого скрипта
   echo
   echo "Продолжаю выполнение..."
   echo
   
-  # Выполняем второй скрипт
+  # Выполняем второй скрипт с полной защитой от завершения
   echo "Выполняю unlimit_server.sh..."
+  set +e
   if safe_remote_script "https://dignezzz.github.io/server/unlimit_server.sh" "unlimit оптимизации"; then
     ((success_count++))
   fi
+  set -e
   
   # Явно продолжаем выполнение после второго скрипта
   echo
@@ -875,6 +894,9 @@ step_sysctl_unlimit() {
   echo
   echo "Оптимизации завершены. Скрипт продолжает работу..."
   sleep 2
+  
+  # Гарантируем возврат успешного кода, чтобы скрипт продолжал работу
+  return 0
 }
 
 # --- Шаг 12/10: Дополнительные SSH настройки безопасности ---
@@ -1114,7 +1136,13 @@ main() {
   step_unattended;             cls
   step_journald_limits;        cls
   step_motd_custom;            cls
-  step_sysctl_unlimit;         cls
+  
+  # Шаг 11 выполняется с дополнительной защитой от завершения
+  set +e
+  step_sysctl_unlimit || true
+  set -e
+  cls
+  
   step_ssh_additional_hardening; cls
   
   # Проверка целостности перед завершением
