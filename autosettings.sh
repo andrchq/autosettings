@@ -308,23 +308,47 @@ safe_remote_script() {
   # Сохраняем скрипт во временный файл для логирования
   local tmp_script="/tmp/remote_script_$(date +%s).sh"
   echo "$script_content" > "$tmp_script"
+  
+  # Заменяем все exit на return, чтобы не завершать основной скрипт
+  # Это критично для предотвращения завершения основного скрипта
+  sed -i 's/^[[:space:]]*exit[[:space:]]/return /g' "$tmp_script"
+  sed -i 's/^[[:space:]]*exit$/return 0/g' "$tmp_script"
+  # Также заменяем exit в функциях и условиях
+  sed -i 's/exit 0/return 0/g' "$tmp_script"
+  sed -i 's/exit 1/return 1/g' "$tmp_script"
+  sed -i 's/exit \$?/return $?/g' "$tmp_script"
+  
   chmod +x "$tmp_script"
-  log_action "Скрипт сохранён: $tmp_script"
+  log_action "Скрипт сохранён: $tmp_script (exit заменён на return)"
   
   # Выполняем с обработкой ошибок и stdin при необходимости
   # Сохраняем вывод в лог, но также показываем пользователю
+  # Важно: выполняем в подпроцессе с явной обработкой ошибок
   local output_file="/tmp/remote_script_output_$(date +%s)"
   local rc=0
+  
+  # Обёртка для выполнения скрипта - предотвращает завершение основного скрипта
+  # Используем подпроцесс () с явной обработкой, чтобы exit из внешнего скрипта не завершал основной
+  set +e
   if [[ -n "$stdin_input" ]]; then
-    echo "$stdin_input" | bash "$tmp_script" > "$output_file" 2>&1 || rc=$?
+    (
+      echo "$stdin_input" | bash "$tmp_script" > "$output_file" 2>&1
+      exit $?
+    ) 2>/dev/null || rc=$?
   else
-    bash "$tmp_script" > "$output_file" 2>&1 || rc=$?
+    (
+      bash "$tmp_script" > "$output_file" 2>&1
+      exit $?
+    ) 2>/dev/null || rc=$?
   fi
+  set -e
   
   # Показываем вывод и сохраняем в лог
-  cat "$output_file"
-  cat "$output_file" >> "$LOG_FILE"
-  rm -f "$output_file"
+  if [[ -f "$output_file" ]]; then
+    cat "$output_file"
+    cat "$output_file" >> "$LOG_FILE"
+    rm -f "$output_file"
+  fi
   rm -f "$tmp_script"
   
   if [[ $rc -ne 0 ]]; then
@@ -332,6 +356,9 @@ safe_remote_script() {
   else
     log_action "Успешно: Выполнение скрипта $description"
   fi
+  
+  # Явно возвращаем управление, чтобы скрипт продолжал работу
+  # Это важно - гарантируем что даже если внешний скрипт использовал exit, мы продолжаем
   return $rc
 }
 
@@ -813,12 +840,28 @@ step_sysctl_unlimit() {
   fi
   
   local success_count=0
+  
+  # Выполняем первый скрипт
+  echo "Выполняю sysctl_opt.sh..."
   if safe_remote_script "https://dignezzz.github.io/server/sysctl_opt.sh" "sysctl оптимизации"; then
     ((success_count++))
   fi
+  
+  # Явно продолжаем выполнение после первого скрипта
+  echo
+  echo "Продолжаю выполнение..."
+  echo
+  
+  # Выполняем второй скрипт
+  echo "Выполняю unlimit_server.sh..."
   if safe_remote_script "https://dignezzz.github.io/server/unlimit_server.sh" "unlimit оптимизации"; then
     ((success_count++))
   fi
+  
+  # Явно продолжаем выполнение после второго скрипта
+  echo
+  echo "Продолжаю выполнение..."
+  echo
   
   if [[ $success_count -eq 2 ]]; then
     echo "✓ Готово: Все оптимизации применены успешно."
@@ -827,6 +870,11 @@ step_sysctl_unlimit() {
   else
     echo "❌ Ошибка: Не удалось применить оптимизации. Проверьте логи: $LOG_FILE"
   fi
+  
+  # Явное сообщение о продолжении работы скрипта
+  echo
+  echo "Оптимизации завершены. Скрипт продолжает работу..."
+  sleep 2
 }
 
 # --- Шаг 12/10: Дополнительные SSH настройки безопасности ---
@@ -939,12 +987,12 @@ check_system_integrity() {
   return ${#issues[@]}
 }
 
-# --- Шаг 13/10: Установка BBR3 и завершение мастера ---
-step_bbr3_install_and_exit() {
+# --- Шаг 13/13: Установка BBR3 ---
+step_bbr3_install() {
   cls
   print_header "Шаг 13/13 — Установка BBR3"
-  echo "После установки скрипт завершится,"
-  echo "а установщик BBR предложит перезагрузку."
+  echo "Установщик BBR3 будет запущен в интерактивном режиме."
+  echo "После завершения установки скрипт продолжит работу."
   echo
   
   if ! ask_yesno "Запустить установку BBR3 сейчас?" "y"; then
@@ -952,23 +1000,103 @@ step_bbr3_install_and_exit() {
   fi
 
   cls
-  echo -e "\nЗапускаю установщик BBR3. После его завершения мастер выйдет.\nЕсли установщик попросит перезагрузку — соглашаемся.\n"
+  echo -e "\n▶ Запускаю установщик BBR3...\n"
+  echo "⚠ Установщик работает в интерактивном режиме."
+  echo "   После завершения установки скрипт продолжится.\n"
   log_action "Запуск установщика BBR3"
   
-  # Для BBR3 используем прямой вызов, т.к. он интерактивный и должен завершить скрипт
-  local script_content
-  script_content=$(curl -fsS4 https://raw.githubusercontent.com/opiran-club/VPS-Optimizer/main/bbrv3.sh 2>&1)
-  if [[ $? -eq 0 ]] && [[ -n "$script_content" ]]; then
-    echo "$script_content" | bash -s --ipv4 || true
-    log_action "Установщик BBR3 завершён"
-  else
-    log_action "ОШИБКА: Не удалось загрузить установщик BBR3"
-    echo "❌ Ошибка: Не удалось загрузить установщик BBR3. Проверьте подключение к интернету."
+  # Проверяем подключение к интернету
+  if ! check_internet; then
+    log_action "ОШИБКА: Нет подключения к интернету для установки BBR3"
+    echo "❌ Ошибка: Нет подключения к интернету. Пропуск установки BBR3."
+    return 1
   fi
   
-  echo -e "\nМастер завершён. Продолжай по инструкциям установщика BBR (перезагрузка).\n"
-  log_action "=== Завершение autosettings.sh $(date) ==="
-  exit 0
+  # Загружаем скрипт BBR3
+  local script_content
+  script_content=$(curl -fsS4 https://raw.githubusercontent.com/opiran-club/VPS-Optimizer/main/bbrv3.sh 2>&1)
+  if [[ $? -ne 0 ]] || [[ -z "$script_content" ]]; then
+    log_action "ОШИБКА: Не удалось загрузить установщик BBR3"
+    echo "❌ Ошибка: Не удалось загрузить установщик BBR3. Проверьте подключение к интернету."
+    return 1
+  fi
+  
+  # Сохраняем скрипт во временный файл
+  local tmp_script="/tmp/bbr3_installer_$(date +%s).sh"
+  echo "$script_content" > "$tmp_script"
+  chmod +x "$tmp_script"
+  log_action "Скрипт BBR3 сохранён: $tmp_script"
+  
+  # Выполняем BBR3 в подпроцессе с защитой от завершения основного скрипта
+  # Важно: выполняем напрямую для интерактивности, но в подпроцессе чтобы exit из BBR3 не завершал основной скрипт
+  local rc=0
+  
+  # Выполняем в подпроцессе - это защищает основной скрипт от exit из BBR3
+  # Выполняем напрямую без перенаправления для сохранения интерактивности
+  set +e
+  (
+    # Подпроцесс выполнит скрипт и завершится, но это не завершит основной скрипт
+    bash "$tmp_script" --ipv4
+    exit $?
+  ) || rc=$?
+  set -e
+  
+  # Очищаем временный файл
+  rm -f "$tmp_script"
+  
+  echo
+  if [[ $rc -eq 0 ]]; then
+    echo "✓ Установка BBR3 завершена успешно"
+    log_action "Установка BBR3 завершена успешно"
+  else
+    echo "⚠ Установка BBR3 завершена с кодом $rc"
+    log_action "Установка BBR3 завершена с кодом $rc"
+  fi
+  
+  echo
+  echo "Скрипт продолжает работу..."
+  sleep 2
+  
+  return $rc
+}
+
+# Функция выбора начального шага
+select_start_step() {
+  cls
+  print_header "Выбор начального шага"
+  echo "Выберите с какого шага начать выполнение:"
+  echo
+  echo "  1) Hostname и часовой пояс"
+  echo "  2) Настройка SSH"
+  echo "  3) Создание sudo-пользователя"
+  echo "  4) Обновление системы"
+  echo "  5) Настройка swap"
+  echo "  6) Базовые компоненты и Docker"
+  echo "  7) Fail2Ban"
+  echo "  8) Автообновления"
+  echo "  9) Логи journald"
+  echo " 10) Кастомный MOTD"
+  echo " 11) Оптимизации системы"
+  echo " 12) Дополнительные SSH настройки"
+  echo " 13) Установка BBR3"
+  echo
+  echo "  0) Выполнить все шаги с начала"
+  echo
+  
+  while true; do
+    echo -n "Введите номер шага (0-13) [0]: "
+    read -r start_step
+    
+    # Если пустой ввод - используем 0 (все шаги)
+    [[ -z "$start_step" ]] && start_step=0
+    
+    if [[ "$start_step" =~ ^[0-9]+$ ]] && (( start_step >= 0 && start_step <= 13 )); then
+      echo "$start_step"
+      return 0
+    else
+      echo "⚠ Неверный номер. Введите число от 0 до 13."
+    fi
+  done
 }
 
 main() {
@@ -989,6 +1117,17 @@ main() {
   echo
   echo "⚠ Защита от случайного завершения: для остановки скрипта нажмите Ctrl+C 3 раза"
   echo
+  
+  # Выбор начального шага
+  local start_step
+  start_step=$(select_start_step)
+  
+  if [[ $start_step -eq 0 ]]; then
+    echo "Выполнение всех шагов с начала."
+  else
+    echo "Начинаю выполнение с шага $start_step."
+  fi
+  echo
   read -p "Нажмите Enter для продолжения..."
   
   # Проверка интернета (предупреждение, но не блокируем)
@@ -1003,27 +1142,59 @@ main() {
     fi
   fi
 
-  # Проверка системных требований
-  check_system_prerequisites
+  # Проверка системных требований (только если начинаем с начала)
+  if [[ $start_step -le 1 ]]; then
+    check_system_prerequisites
+  fi
   
-  log_action "Начало выполнения шагов мастера"
-  step_hostname_tz;            cls
-  step_ssh_hardening;          cls
-  step_create_user;            cls
-  step_updates_now;            cls
-  step_configure_swap;         cls
-  step_components;             cls
-  step_fail2ban_basic;         cls
-  step_unattended;             cls
-  step_journald_limits;        cls
-  step_motd_custom;            cls
-  step_sysctl_unlimit;         cls
-  step_ssh_additional_hardening; cls
+  log_action "Начало выполнения шагов мастера с шага $start_step"
   
-  # Проверка целостности перед завершением
-  check_system_integrity
+  # Выполняем шаги в зависимости от выбранного начального шага
+  if [[ $start_step -le 1 ]]; then
+    step_hostname_tz;            cls
+  fi
+  if [[ $start_step -le 2 ]]; then
+    step_ssh_hardening;          cls
+  fi
+  if [[ $start_step -le 3 ]]; then
+    step_create_user;            cls
+  fi
+  if [[ $start_step -le 4 ]]; then
+    step_updates_now;            cls
+  fi
+  if [[ $start_step -le 5 ]]; then
+    step_configure_swap;         cls
+  fi
+  if [[ $start_step -le 6 ]]; then
+    step_components;             cls
+  fi
+  if [[ $start_step -le 7 ]]; then
+    step_fail2ban_basic;         cls
+  fi
+  if [[ $start_step -le 8 ]]; then
+    step_unattended;             cls
+  fi
+  if [[ $start_step -le 9 ]]; then
+    step_journald_limits;        cls
+  fi
+  if [[ $start_step -le 10 ]]; then
+    step_motd_custom;            cls
+  fi
+  if [[ $start_step -le 11 ]]; then
+    step_sysctl_unlimit;         cls
+  fi
+  if [[ $start_step -le 12 ]]; then
+    step_ssh_additional_hardening; cls
+  fi
   
-  step_bbr3_install_and_exit
+  # Проверка целостности перед завершением (только если не пропустили шаги)
+  if [[ $start_step -le 12 ]]; then
+    check_system_integrity
+  fi
+  
+  if [[ $start_step -le 13 ]]; then
+    step_bbr3_install
+  fi
   
   log_action "=== Завершение autosettings.sh $(date) ==="
   local duration=$(( $(date +%s) - SCRIPT_START_TIME ))
@@ -1033,6 +1204,28 @@ main() {
   echo "Время выполнения: ${duration} сек"
   echo "Логи: $LOG_FILE"
   echo
+  
+  # Предложение перезагрузки сервера
+  echo "═══════════════════════════════════════"
+  echo "Рекомендуется перезагрузить сервер для применения всех изменений."
+  echo "Особенно важно после установки BBR3."
+  echo "═══════════════════════════════════════"
+  echo
+  
+  if ask_yesno "Перезагрузить сервер сейчас?" "n"; then
+    log_action "Пользователь запросил перезагрузку сервера"
+    echo
+    echo "▶ Выполняется перезагрузка через 5 секунд..."
+    echo "   (Нажмите Ctrl+C для отмены)"
+    sleep 5
+    log_action "Перезагрузка сервера..."
+    reboot
+  else
+    echo
+    echo "Перезагрузка отменена. Вы можете перезагрузить сервер позже командой:"
+    echo "  sudo reboot"
+    echo
+  fi
 }
 
 main "$@"
