@@ -2,515 +2,158 @@
 set -Eeuo pipefail
 
 # === Интерактивный установщик базовой конфигурации Ubuntu ===
-# Требования: root. Ввод данных через терминал. После каждого шага — очистка экрана.
+# Требования: root. Диалоги через whiptail. Каждый шаг — очистка экрана.
 
-# Глобальные переменные
-readonly LOG_FILE="/var/log/autosettings.log"
-readonly BACKUP_DIR="/root/autosettings_backup_$(date +%Y%m%d_%H%M%S)"
-readonly SCRIPT_START_TIME=$(date +%s)
-
-# Счётчик нажатий Ctrl+C
-CTRL_C_COUNT=0
-readonly CTRL_C_REQUIRED=3
-
-# Инициализация логирования и резервного копирования
-init_logging() {
-  mkdir -p "$(dirname "$LOG_FILE")"
-  echo "=== Запуск autosettings.sh $(date) ===" >> "$LOG_FILE"
-  # Не перенаправляем stdout/stderr, чтобы не мешать whiptail и spinner
-  # Логирование происходит через log_action
-}
-
-init_backup_dir() {
-  mkdir -p "$BACKUP_DIR"
-  echo "BACKUP_DIR=$BACKUP_DIR" > "$BACKUP_DIR/info.txt"
-  echo "START_TIME=$(date)" >> "$BACKUP_DIR/info.txt"
-}
-
-log_action() {
-  echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" >> "$LOG_FILE"
-}
-
-# Обработчик Ctrl+C - требует 3 нажатия для завершения
-handle_ctrl_c() {
-  ((CTRL_C_COUNT++))
-  
-  echo
-  echo "⚠ Предупреждение: Обнаружено нажатие Ctrl+C ($CTRL_C_COUNT/$CTRL_C_REQUIRED)"
-  
-  if [[ $CTRL_C_COUNT -ge $CTRL_C_REQUIRED ]]; then
-    echo
-    echo "❌ Скрипт завершён по запросу пользователя (3 нажатия Ctrl+C)"
-    log_action "Скрипт завершён пользователем (Ctrl+C x$CTRL_C_COUNT)"
-    exit 130
-  else
-    local remaining=$((CTRL_C_REQUIRED - CTRL_C_COUNT))
-    echo "Для завершения скрипта нажмите Ctrl+C ещё $remaining раз(а)"
-    echo "Продолжаю выполнение..."
-    echo
+# --- Утилиты ---
+require_root() {
+  if [[ $EUID -ne 0 ]]; then
+    echo "Запусти скрипт от root: sudo bash $0"
+    exit 1
   fi
 }
 
-check_internet() {
-  if ! ping -c 1 -W 2 8.8.8.8 >/dev/null 2>&1 && ! curl -fsS4 https://www.google.com >/dev/null 2>&1; then
-    return 1
+install_whiptail() {
+  if ! command -v whiptail >/dev/null 2>&1; then
+    apt-get update -y
+    DEBIAN_FRONTEND=noninteractive apt-get install -y whiptail
   fi
-  return 0
 }
-
-check_system_prerequisites() {
-  log_action "Проверка системных требований"
-  local issues=()
-  
-  # Проверка версии ОС
-  if [[ ! -f /etc/os-release ]]; then
-    issues+=("Не найдено /etc/os-release")
-  else
-    . /etc/os-release
-    if [[ "$ID" != "ubuntu" ]] && [[ "$ID" != "debian" ]]; then
-      issues+=("Скрипт предназначен для Ubuntu/Debian, обнаружено: $ID")
-    fi
-    log_action "ОС: $PRETTY_NAME"
-  fi
-  
-  # Проверка места на диске (минимум 2GB свободно)
-  local available_space
-  available_space=$(df / | tail -1 | awk '{print $4}')
-  if [[ $available_space -lt 2097152 ]]; then # 2GB в KB
-    issues+=("Мало места на диске: менее 2GB свободно")
-  fi
-  log_action "Свободно на диске: $(( available_space / 1024 ))MB"
-  
-  # Проверка памяти
-  local total_mem
-  total_mem=$(free -m | awk '/^Mem:/{print $2}')
-  log_action "Общая память: ${total_mem}MB"
-  
-  # Проверка архитектуры
-  local arch
-  arch=$(uname -m)
-  log_action "Архитектура: $arch"
-  
-  if [[ ${#issues[@]} -gt 0 ]]; then
-    echo
-    print_header "⚠ ПРЕДУПРЕЖДЕНИЕ"
-    echo "Обнаружены проблемы:"
-    for issue in "${issues[@]}"; do
-      echo "  • $issue"
-    done
-    echo
-    if ! ask_yesno "Продолжить выполнение?" "y"; then
-      log_action "Пользователь отменил выполнение из-за проблем с системой"
-      exit 0
-    fi
-  fi
-  
-  return 0
-}
-
-require_root() { if [[ $EUID -ne 0 ]]; then echo "Запусти: sudo bash $0"; exit 1; fi; }
 
 cls() { clear || true; }
 
-# Простые функции для ввода данных в терминале
-print_header() {
-  echo "=========================================="
-  echo "$1"
-  echo "=========================================="
-  echo
+info_box() {
+  whiptail --title "$1" --msgbox "$2" 12 78
 }
 
-print_info() {
-  echo "ℹ $1"
-  echo
+yesno() {
+  local title="$1"; shift
+  local text="$1"; shift || true
+  if whiptail --title "$title" --yesno "$text" 12 78; then return 0; else return 1; fi
 }
 
-ask_yesno() {
-  local prompt="$1"
-  local default="${2:-y}"  # По умолчанию "да"
-  
-  # Проверяем доступность whiptail
-  if command -v whiptail >/dev/null 2>&1; then
-    local default_button=""
-    if [[ "$default" == "n" ]]; then
-      default_button="--defaultno"
-    fi
-    
-    if whiptail --title "Подтверждение" --yesno "$prompt" $default_button 10 60 3>&1 1>&2 2>&3; then
-      return 0
-    else
-      return 1
-    fi
-  else
-    # Fallback на терминальный ввод если whiptail недоступен
-    while true; do
-      if [[ "$default" == "y" ]]; then
-        echo -n "$prompt [Y/n] (Enter = да): "
-      else
-        echo -n "$prompt [y/N] (Enter = нет): "
-      fi
-      read -r answer
-      
-      # Если пустой ответ - используем значение по умолчанию
-      [[ -z "$answer" ]] && answer="$default"
-      
-      case "$answer" in
-        [Yy]|[Yy][Ee][Ss]) return 0 ;;
-        [Nn]|[Nn][Oo]) return 1 ;;
-        *) echo "Пожалуйста, введите y или n (или нажмите Enter для значения по умолчанию)" ;;
-      esac
-    done
-  fi
+input_box() {
+  local title="$1"; shift
+  local text="$1"; shift
+  local default="${1:-}"
+  local out
+  out=$(whiptail --title "$title" --inputbox "$text" 12 78 "$default" 3>&1 1>&2 2>&3) || return 1
+  printf "%s" "$out"
 }
 
-ask_input() {
-  local prompt="$1"
-  local default="${2:-}"
-  local var_name="${3:-}"
-  
-  # Проверяем доступность whiptail
-  if command -v whiptail >/dev/null 2>&1; then
-    local result=""
-    local exit_code=0
-    
-    if [[ -n "$default" ]]; then
-      result=$(whiptail --title "Ввод данных" --inputbox "$prompt" 10 60 "$default" 3>&1 1>&2 2>&3)
-      exit_code=$?
-    else
-      result=$(whiptail --title "Ввод данных" --inputbox "$prompt" 10 60 "" 3>&1 1>&2 2>&3)
-      exit_code=$?
-    fi
-    
-    # Если пользователь нажал Cancel или ESC, используем значение по умолчанию если есть
-    if [[ $exit_code -ne 0 ]]; then
-      if [[ -n "$default" ]]; then
-        result="$default"
-      else
-        result=""
-      fi
-    fi
-    
-    # Если результат пустой и есть значение по умолчанию - используем его
-    if [[ -z "$result" ]] && [[ -n "$default" ]]; then
-      result="$default"
-    fi
-    
-    if [[ -n "$var_name" ]]; then
-      eval "$var_name=\"$result\""
-    else
-      echo "$result"
-    fi
-  else
-    # Fallback на терминальный ввод если whiptail недоступен
-    if [[ -n "$default" ]]; then
-      echo -n "$prompt [$default]: "
-    else
-      echo -n "$prompt: "
-    fi
-    
-    read -r answer
-    
-    # Если пустой ответ и есть значение по умолчанию - используем его
-    if [[ -z "$answer" ]] && [[ -n "$default" ]]; then
-      answer="$default"
-    fi
-    
-    if [[ -n "$var_name" ]]; then
-      eval "$var_name=\"$answer\""
-    else
-      echo "$answer"
-    fi
-  fi
+password_box() {
+  local title="$1"; shift
+  local text="$1"; shift
+  local out
+  out=$(whiptail --title "$title" --passwordbox "$text" 12 78 3>&1 1>&2 2>&3) || return 1
+  printf "%s" "$out"
 }
 
-retry_on_error() {
-  local step_name="$1"
-  shift
-  
-  while true; do
-    if "$@"; then
-      return 0
-    else
-      local rc=$?
-      echo
-      echo "❌ Ошибка при выполнении: $step_name (код: $rc)"
-      if ask_yesno "Повторить выполнение этого шага?" "y"; then
-        echo
-        continue
-      else
-        echo "Пропуск шага: $step_name"
-        return $rc
-      fi
-    fi
-  done
-}
-spinner() { # spinner "msg" cmd...
-  local msg="$1"; shift; 
-  log_action "Начало: $msg"
-  echo -e "\n▶ $msg...\n"
-  set +e; "$@" & local pid=$!; local spin='-\|/'; local i=0
-  while kill -0 "$pid" 2>/dev/null; do 
-    i=$(( (i+1)%4 )); 
-    printf "\r[%c] Работаю..." "${spin:$i:1}"; 
+spinner() {
+  # spinner "Описание задачи" command args...
+  local msg="$1"; shift
+  cls
+  echo -e "\n$msg...\n"
+  set +e
+  "$@" &
+  local pid=$!
+  local spin='-\|/'
+  local i=0
+  while kill -0 "$pid" 2>/dev/null; do
+    i=$(( (i+1) %4 ))
+    printf "\r[%c] Работаю..." "${spin:$i:1}"
     sleep 0.2
   done
-  wait "$pid"; local rc=$?; set -e; printf "\r"
-  if [[ $rc -eq 0 ]]; then
-    echo "✓ Успешно завершено"
-    log_action "Успешно: $msg"
-  else
-    echo "✗ Ошибка (код: $rc)"
-    log_action "ОШИБКА (код $rc): $msg"
-  fi
-  echo
+  wait "$pid"
+  local rc=$?
+  set -e
+  printf "\r"
   return $rc
 }
-backup_file() { 
-  local file="$1"
-  if [[ -f "$file" ]] || [[ -d "$file" ]]; then
-    local backup_path="$BACKUP_DIR${file}"
-    mkdir -p "$(dirname "$backup_path")"
-    cp -a "$file" "$backup_path" 2>/dev/null || true
-    log_action "Резервная копия: $file -> $backup_path"
-    # Также создаём локальную копию с timestamp для совместимости
-    [[ -f "$file" ]] && cp -a "$file" "$file.bak.$(date +%Y%m%d%H%M%S)" 2>/dev/null || true
-  fi
-}
 
-validate_ssh_key() {
-  local key="$1"
-  # Проверяем формат ключа (ssh-ed25519, ssh-rsa, ecdsa-sha2, ssh-dss)
-  if [[ "$key" =~ ^(ssh-ed25519|ssh-rsa|ecdsa-sha2-nistp[0-9]+|ssh-dss)\ +[A-Za-z0-9+/=]+ ]]; then
-    return 0
-  fi
-  return 1
-}
-
-validate_time_format() {
-  local time_str="$1"
-  # Проверяем формат времени (например, 1h, 30m, 2d)
-  if [[ "$time_str" =~ ^[0-9]+[smhd]$ ]]; then
-    return 0
-  fi
-  return 1
-}
-
-validate_size_format() {
-  local size="$1"
-  # Проверяем формат размера (например, 500M, 1G)
-  if [[ "$size" =~ ^[0-9]+[KMGT]?$ ]]; then
-    return 0
-  fi
-  return 1
-}
-
-check_service_status() {
-  local service="$1"
-  if systemctl is-active --quiet "$service" 2>/dev/null; then
-    log_action "Сервис $service активен"
-    return 0
-  else
-    log_action "ПРЕДУПРЕЖДЕНИЕ: сервис $service не активен"
-    return 1
+backup_file() {
+  local f="$1"
+  if [[ -f "$f" ]]; then
+    cp -a "$f" "${f}.bak.$(date +%Y%m%d%H%M%S)"
   fi
 }
 
 apply_and_restart_sshd_safely() {
-  log_action "Проверка конфигурации SSH перед перезапуском"
+  # Проверяем синтаксис и перезапускаем ssh
   if sshd -t -f /etc/ssh/sshd_config; then
     systemctl restart ssh || systemctl restart sshd || true
-    sleep 2
-    check_service_status ssh || check_service_status sshd
   else
-    log_action "ОШИБКА: Неверная конфигурация SSH, откат"
-    echo "❌ Ошибка в /etc/ssh/sshd_config. Выполняется откат..."
+    info_box "SSH" "Обнаружены ошибки в /etc/ssh/sshd_config. Откатываю изменения."
     if compgen -G "/etc/ssh/sshd_config.bak.*" >/dev/null; then
-      cp -f "$(ls -t /etc/ssh/sshd_config.bak.* | head -n1)" /etc/ssh/sshd_config
-      log_action "Откат SSH конфигурации выполнен"
-      echo "✓ Конфигурация SSH восстановлена из резервной копии"
-    else
-      echo "⚠ Резервная копия не найдена"
+      local last_backup
+      last_backup=$(ls -t /etc/ssh/sshd_config.bak.* | head -n1)
+      cp -f "$last_backup" /etc/ssh/sshd_config
     fi
   fi
 }
 
-safe_remote_script() {
-  local url="$1"
-  local description="$2"
-  local stdin_input="${3:-}"
-  
-  log_action "Загрузка и выполнение: $description ($url)"
-  if ! check_internet; then
-    log_action "ОШИБКА: Нет подключения к интернету для $description"
-    echo "❌ Ошибка: Нет подключения к интернету. Пропуск: $description"
-    return 1
-  fi
-  
-  local script_content
-  script_content=$(curl -fsS4 "$url" 2>&1)
-  if [[ $? -ne 0 ]] || [[ -z "$script_content" ]]; then
-    log_action "ОШИБКА: Не удалось загрузить скрипт $url"
-    echo "❌ Ошибка: Не удалось загрузить скрипт: $description"
-    echo "   URL: $url"
-    return 1
-  fi
-  
-  # Сохраняем скрипт во временный файл для логирования
-  local tmp_script="/tmp/remote_script_$(date +%s).sh"
-  echo "$script_content" > "$tmp_script"
-  
-  # Заменяем все exit и exec на return, чтобы не завершать основной скрипт
-  # Это критично для предотвращения завершения основного скрипта
-  # Используем множественные замены для всех вариантов exit и exec
-  sed -i 's/^[[:space:]]*exit[[:space:]]*$/return 0/g' "$tmp_script"
-  sed -i 's/exit 0/return 0/g' "$tmp_script"
-  sed -i 's/exit 1/return 1/g' "$tmp_script"
-  sed -i 's/exit 2/return 2/g' "$tmp_script"
-  sed -i 's/exit 3/return 3/g' "$tmp_script"
-  sed -i 's/exit \$?/return $?/g' "$tmp_script"
-  sed -i 's/exit $?/return $?/g' "$tmp_script"
-  # Заменяем exec на return (exec может заменить процесс)
-  sed -i 's/^[[:space:]]*exec[[:space:]]/return 0 # exec replaced /g' "$tmp_script"
-  # Заменяем exit с любым числом (цикл для чисел 0-255)
-  for i in {0..255}; do
-    sed -i "s/exit $i/return $i/g" "$tmp_script"
-  done
-  # Также заменяем варианты с пробелами после exit
-  sed -i 's/exit[[:space:]]*$/return 0/g' "$tmp_script"
-  
-  chmod +x "$tmp_script"
-  log_action "Скрипт сохранён: $tmp_script (exit и exec заменены на return)"
-  
-  # Выполняем с обработкой ошибок и stdin при необходимости
-  # Сохраняем вывод в лог, но также показываем пользователю
-  # КРИТИЧНО: Выполняем через полностью изолированный shell-процесс
-  # Используем bash -c с оберткой, которая гарантирует возврат управления
-  local output_file="/tmp/remote_script_output_$(date +%s)"
-  local rc=0
-  
-  # Создаём обёрточный скрипт, который гарантирует возврат управления
-  local wrapper_script="/tmp/wrapper_$(date +%s).sh"
-  cat > "$wrapper_script" <<'WRAPPER_EOF'
-#!/bin/bash
-set +e
-SCRIPT_PATH="$1"
-OUTPUT_FILE="$2"
-STDIN_INPUT="$3"
-
-if [[ -n "$STDIN_INPUT" ]]; then
-  echo "$STDIN_INPUT" | bash "$SCRIPT_PATH" > "$OUTPUT_FILE" 2>&1
-  EXIT_CODE=$?
-else
-  bash "$SCRIPT_PATH" > "$OUTPUT_FILE" 2>&1
-  EXIT_CODE=$?
-fi
-
-# Гарантируем возврат кода выхода, но не завершаем родительский процесс
-exit $EXIT_CODE
-WRAPPER_EOF
-  chmod +x "$wrapper_script"
-  
-  # Выполняем обёрточный скрипт в полностью изолированном процессе
-  # Используем команду bash -c в subshell для создания нового shell-процесса
-  # Это гарантирует, что даже если скрипт завершит процесс, родительский скрипт продолжит работу
-  set +e
-  (
-    if [[ -n "$stdin_input" ]]; then
-      bash -c "bash \"$wrapper_script\" \"$tmp_script\" \"$output_file\" \"$stdin_input\"" 2>/dev/null
-    else
-      bash -c "bash \"$wrapper_script\" \"$tmp_script\" \"$output_file\" \"\"" 2>/dev/null
-    fi
-  ) || rc=$?
-  set -e
-  
-  # Очищаем временные файлы
-  rm -f "$wrapper_script"
-  
-  # Показываем вывод и сохраняем в лог
-  if [[ -f "$output_file" ]]; then
-    cat "$output_file"
-    cat "$output_file" >> "$LOG_FILE"
-    rm -f "$output_file"
-  fi
-  rm -f "$tmp_script"
-  
-  if [[ $rc -ne 0 ]]; then
-    log_action "ОШИБКА (код $rc): Выполнение скрипта $description"
-  else
-    log_action "Успешно: Выполнение скрипта $description"
-  fi
-  
-  # Явно возвращаем управление, чтобы скрипт продолжал работу
-  # Это важно - гарантируем что даже если внешний скрипт использовал exit, мы продолжаем
-  return $rc
-}
-
-# --- Шаг 1/10: Hostname + TZ ---
+# --- Шаг 1: Hostname + TZ Moscow ---
 step_hostname_tz() {
   cls
-  print_header "Шаг 1/13 — Имя сервера и часовой пояс"
-  
-  if ! ask_yesno "Установить hostname и часовой пояс (Europe/Moscow)?" "y"; then
+  if ! yesno "Шаг 1/8 — Имя сервера и часовой пояс" "Установить hostname и часовой пояс (Europe/Moscow)?"; then
     return 0
   fi
-  
-  ask_input "Введи hostname (например, prst-srv-01)" "" "new_hostname"
-  [[ -z "$new_hostname" ]] && { echo "⚠ Пустое имя — пропуск."; return 0; }
 
-  # Часовой пояс всегда Europe/Moscow
-  local timezone="Europe/Moscow"
-  echo "Часовой пояс: $timezone (по умолчанию)"
+  local new_hostname
+  new_hostname=$(input_box "Имя сервера (hostname)" "Введи имя сервера (например, prst-srv-01):" "") || return 0
+  if [[ -z "$new_hostname" ]]; then
+    info_box "Hostname" "Пустое имя — шаг пропущен."
+    return 0
+  fi
 
-  if retry_on_error "Установка hostname и часового пояса" spinner "Устанавливаю hostname и часовой пояс" bash -c "
+  spinner "Устанавливаю hostname и часовой пояс Europe/Moscow" bash -c "
     backup_file /etc/hostname
     backup_file /etc/hosts
+
     hostnamectl set-hostname \"$new_hostname\"
-    grep -qE \"127.0.1.1\\s+$new_hostname\" /etc/hosts || echo -e \"127.0.1.1\t$new_hostname\" >> /etc/hosts
-    timedatectl set-timezone \"$timezone\"
+    # корректируем /etc/hosts
+    if ! grep -qE \"127.0.1.1\\s+$new_hostname\" /etc/hosts; then
+      echo -e \"127.0.1.1\t$new_hostname\" >> /etc/hosts
+    fi
+
+    timedatectl set-timezone Europe/Moscow
     timedatectl set-ntp true
-  "; then
-    echo "✓ Готово: Имя: $new_hostname, TZ: $timezone"
-  fi
+  "
+
+  info_box "Готово" "Имя сервера: $new_hostname\nЧасовой пояс: Europe/Moscow."
 }
 
-# --- Шаг 2/10: SSH порт/ключ/только ключи/root/лимиты ---
+# --- Шаг 2: SSH: порт, ключ, только по ключам, root, MaxAuthTries/Sessions ---
 step_ssh_hardening() {
   cls
-  print_header "Шаг 2/13 — Настройка SSH"
-  echo "Настроить SSH: кастомный порт, вход только по ключам,"
-  echo "root по ключам, MaxAuthTries=2, MaxSessions=2"
-  echo
-  
-  if ! ask_yesno "Настроить SSH?" "y"; then
+  if ! yesno "Шаг 2/8 — SSH-настройки" "Настроить SSH: кастомный порт, вход только по ключам,\nroot по ключам, MaxAuthTries=2, MaxSessions=2?"; then
     return 0
   fi
 
-  ask_input "Введи новый порт SSH (1024–65535)" "2222" "ssh_port"
+  local ssh_port
+  ssh_port=$(input_box "Порт SSH" "Введи новый порт SSH (1024–65535):" "2222") || return 0
   if ! [[ "$ssh_port" =~ ^[0-9]+$ ]] || (( ssh_port < 1024 || ssh_port > 65535 )); then
-    echo "⚠ Некорректный порт. Пропуск."
+    info_box "Порт SSH" "Некорректный порт. Шаг пропущен."
     return 0
   fi
 
-  # Ввод SSH ключа через whiptail
-  if command -v whiptail >/dev/null 2>&1; then
-    pubkey=$(whiptail --title "SSH ключ" --inputbox "Вставь публичный SSH-ключ (ssh-ed25519/ssh-rsa...):" 12 80 "" 3>&1 1>&2 2>&3)
-    [[ $? -ne 0 ]] && pubkey=""
-  else
-    echo "Вставь публичный SSH-ключ (ssh-ed25519/ssh-rsa...):"
-    read -r pubkey
-  fi
-  [[ -z "$pubkey" ]] && { echo "⚠ Ключ не задан. Пропуск."; return 0; }
-  if ! validate_ssh_key "$pubkey"; then
-    echo "⚠ Неверный формат ключа. Ожидается: ssh-ed25519/ssh-rsa/ecdsa-sha2... Пропуск."
-    log_action "ОШИБКА: Неверный формат SSH-ключа"
+  local pubkey
+  pubkey=$(input_box "Публичный SSH-ключ" "Вставь публичный ключ (ssh-ed25519/ssh-rsa...):" "") || return 0
+  if [[ -z "$pubkey" ]]; then
+    info_box "SSH-ключ" "Ключ не задан. Шаг пропущен."
     return 0
   fi
 
-  if retry_on_error "Настройка SSH" spinner "Применяю SSH-настройки" bash -c "
-    mkdir -p /root/.ssh && chmod 700 /root/.ssh
-    touch /root/.ssh/authorized_keys && chmod 600 /root/.ssh/authorized_keys
+  spinner "Применяю SSH-настройки" bash -c "
+    mkdir -p /root/.ssh
+    chmod 700 /root/.ssh
+    touch /root/.ssh/authorized_keys
+    chmod 600 /root/.ssh/authorized_keys
+    # Добавим ключ, если его ещё нет
     grep -qxF \"$pubkey\" /root/.ssh/authorized_keys || echo \"$pubkey\" >> /root/.ssh/authorized_keys
+
     backup_file /etc/ssh/sshd_config
+
+    # Чистим ключевые параметры и задаём желаемые
     sed -i \
       -e 's/^#\\?Port .*/Port $ssh_port/' \
       -e 's/^#\\?PasswordAuthentication .*/PasswordAuthentication no/' \
@@ -520,6 +163,8 @@ step_ssh_hardening() {
       -e 's/^#\\?MaxAuthTries .*/MaxAuthTries 2/' \
       -e 's/^#\\?MaxSessions .*/MaxSessions 2/' \
       /etc/ssh/sshd_config || true
+
+    # Если строк нет — добавим
     grep -q '^Port ' /etc/ssh/sshd_config || echo 'Port $ssh_port' >> /etc/ssh/sshd_config
     grep -q '^PasswordAuthentication ' /etc/ssh/sshd_config || echo 'PasswordAuthentication no' >> /etc/ssh/sshd_config
     grep -q '^ChallengeResponseAuthentication ' /etc/ssh/sshd_config || echo 'ChallengeResponseAuthentication no' >> /etc/ssh/sshd_config
@@ -527,387 +172,113 @@ step_ssh_hardening() {
     grep -q '^PermitRootLogin ' /etc/ssh/sshd_config || echo 'PermitRootLogin prohibit-password' >> /etc/ssh/sshd_config
     grep -q '^MaxAuthTries ' /etc/ssh/sshd_config || echo 'MaxAuthTries 2' >> /etc/ssh/sshd_config
     grep -q '^MaxSessions ' /etc/ssh/sshd_config || echo 'MaxSessions 2' >> /etc/ssh/sshd_config
-  "; then
-    apply_and_restart_sshd_safely
-    echo "✓ Готово: Новый порт: $ssh_port, вход: только ключи; root — по ключу."
-  fi
+  "
+
+  apply_and_restart_sshd_safely
+  info_box "SSH перезапущен" "Новый порт SSH: $ssh_port\nДоп.: вход только по ключам, root разрешён по ключу."
 }
 
-# --- Шаг 3/10: Создание sudo-пользователя ---
-step_create_user() {
-  cls
-  print_header "Шаг 3/13 — Создание sudo-пользователя"
-  
-  if ! ask_yesno "Создать нового sudo-пользователя (рекомендуется для безопасности)?" "y"; then
-    return 0
-  fi
-  
-  ask_input "Введи имя пользователя" "" "username"
-  [[ -z "$username" ]] && { echo "⚠ Пустое имя — пропуск."; return 0; }
-  
-  # Проверка на существование пользователя
-  if id "$username" &>/dev/null; then
-    echo "⚠ Пользователь $username уже существует. Пропуск."
-    return 0
-  fi
-  
-  # Ввод SSH ключа для пользователя через whiptail
-  if command -v whiptail >/dev/null 2>&1; then
-    pubkey_user=$(whiptail --title "SSH ключ для пользователя" --inputbox "Вставь публичный SSH-ключ для пользователя (можно оставить пустым):" 12 80 "" 3>&1 1>&2 2>&3)
-    [[ $? -ne 0 ]] && pubkey_user=""
-  else
-    echo "Вставь публичный SSH-ключ для пользователя (можно оставить пустым):"
-    read -r pubkey_user
-  fi
-  
-  if retry_on_error "Создание пользователя" spinner "Создаю пользователя $username" bash -c "
-    useradd -m -s /bin/bash \"$username\"
-    usermod -aG sudo \"$username\"
-    echo \"$username ALL=(ALL) NOPASSWD:ALL\" > /etc/sudoers.d/99-$username
-    chmod 0440 /etc/sudoers.d/99-$username
-  "; then
-    if [[ -n "$pubkey_user" ]] && validate_ssh_key "$pubkey_user"; then
-      if retry_on_error "Настройка SSH-ключа" spinner "Настраиваю SSH-ключ для $username" bash -c "
-        mkdir -p /home/$username/.ssh
-        chmod 700 /home/$username/.ssh
-        echo \"$pubkey_user\" > /home/$username/.ssh/authorized_keys
-        chmod 600 /home/$username/.ssh/authorized_keys
-        chown -R $username:$username /home/$username/.ssh
-      "; then
-        echo "✓ Готово: Пользователь $username создан с sudo правами. SSH-ключ добавлен."
-      fi
-    else
-      echo "✓ Готово: Пользователь $username создан с sudo правами. SSH-ключ не добавлен (неверный формат или пустой)."
-    fi
-    log_action "Создан пользователь: $username"
-  fi
-}
-
-# --- Шаг 4/10: Обновление системы ---
+# --- Шаг 3: Одноразовое обновление системы сейчас ---
 step_updates_now() {
   cls
-  print_header "Шаг 4/13 — Обновление системы"
-  
-  if ! ask_yesno "Выполнить apt update && apt -y full-upgrade?" "y"; then
+  if ! yesno "Шаг 3/8 — Обновить систему" "Выполнить обновление пакетов (apt update && apt -y full-upgrade)?"; then
     return 0
   fi
-  
-  if retry_on_error "Обновление системы" spinner "Обновляю систему" bash -c "
-    export DEBIAN_FRONTEND=noninteractive
-    export UCF_FORCE_CONFFNEW=1
-    
+  spinner "Обновляю систему" bash -c "
     apt-get update -y
-    
-    # Сначала исправляем сломанные пакеты если есть
-    apt-get install -f -y -o Dpkg::Options::='--force-confdef' -o Dpkg::Options::='--force-confold' || true
-    
-    # Обновление с автоматической обработкой конфигурационных файлов
-    # --force-confdef: использовать версию по умолчанию (обычно сохраняет текущую)
-    # --force-confold: сохранять текущую версию конфигурации
-    apt-get -y full-upgrade -o Dpkg::Options::='--force-confdef' -o Dpkg::Options::='--force-confold'
-  "; then
-    echo "✓ Готово: Система обновлена."
-  fi
+    DEBIAN_FRONTEND=noninteractive apt-get -y full-upgrade
+  "
+  info_box "Готово" "Система обновлена."
 }
 
-# --- Шаг 5/10: Настройка swap ---
-step_configure_swap() {
-  cls
-  print_header "Шаг 5/13 — Настройка swap"
-  
-  # Проверяем существующий swap
-  local swap_total swap_used swap_free
-  swap_total=$(free -m | awk '/^Swap:/{print $2}')
-  swap_used=$(free -m | awk '/^Swap:/{print $3}')
-  swap_free=$(free -m | awk '/^Swap:/{print $4}')
-  
-  if [[ $swap_total -gt 0 ]]; then
-    echo "✓ Обнаружен существующий swap:"
-    echo "  Всего: ${swap_total}MB"
-    echo "  Используется: ${swap_used}MB"
-    echo "  Свободно: ${swap_free}MB"
-    echo
-    
-    # Проверяем источник swap (файл или раздел)
-    local swap_source=""
-    if [[ -f /swapfile ]]; then
-      local swapfile_size
-      swapfile_size=$(du -m /swapfile 2>/dev/null | awk '{print $1}')
-      swap_source="файл /swapfile (${swapfile_size}MB)"
-    elif swapon --show 2>/dev/null | grep -qE "(TYPE|partition)"; then
-      swap_source="раздел диска"
-    else
-      swap_source="файл или раздел (автоопределение)"
-    fi
-    echo "  Источник: $swap_source"
-    echo
-    
-    if ! ask_yesno "Перенастроить swap?" "n"; then
-      echo "Пропуск настройки swap."
-      return 0
-    fi
-  else
-    echo "⚠ Swap не настроен."
-    echo "Рекомендуется настроить swap для стабильной работы системы."
-    echo
-    
-    if ! ask_yesno "Настроить swap-файл?" "y"; then
-      echo "Пропуск настройки swap."
-      return 0
-    fi
-  fi
-  
-  # Определяем рекомендуемый размер на основе RAM
-  local ram_total
-  ram_total=$(free -m | awk '/^Mem:/{print $2}')
-  local recommended_swap=$ram_total
-  if [[ $recommended_swap -lt 2048 ]]; then
-    recommended_swap=2048
-  elif [[ $recommended_swap -gt 8192 ]]; then
-    recommended_swap=8192
-  fi
-  
-  echo "Размер RAM: ${ram_total}MB"
-  echo "Рекомендуемый размер swap: ${recommended_swap}MB"
-  echo
-  
-  ask_input "Размер swap в MB (рекомендуется: ${recommended_swap})" "$recommended_swap" "swap_size_mb"
-  if ! [[ "$swap_size_mb" =~ ^[0-9]+$ ]] || (( swap_size_mb < 256 || swap_size_mb > 16384 )); then
-    echo "⚠ Неверный размер (256-16384 MB). Используется ${recommended_swap}MB."
-    swap_size_mb=$recommended_swap
-  fi
-  
-  if retry_on_error "Настройка swap" spinner "Настраиваю swap-файл ${swap_size_mb}MB" bash -c "
-    # Отключаем существующий swap если есть
-    swapoff -a 2>/dev/null || true
-    
-    # Удаляем старый swap-файл если есть
-    [[ -f /swapfile ]] && rm -f /swapfile
-    
-    # Удаляем старую запись из fstab если есть
-    backup_file /etc/fstab
-    sed -i '/\\/swapfile/d' /etc/fstab
-    
-    # Создаём новый swap-файл
-    dd if=/dev/zero of=/swapfile bs=1M count=$swap_size_mb status=progress
-    chmod 600 /swapfile
-    mkswap /swapfile
-    swapon /swapfile
-    
-    # Добавляем в fstab
-    echo '/swapfile none swap sw 0 0' >> /etc/fstab
-    
-    # Настраиваем swappiness (оптимально 10 для серверов)
-    backup_file /etc/sysctl.conf
-    if ! grep -q '^vm.swappiness=' /etc/sysctl.conf; then
-      echo 'vm.swappiness=10' >> /etc/sysctl.conf
-    else
-      sed -i 's/^vm.swappiness=.*/vm.swappiness=10/' /etc/sysctl.conf
-    fi
-    sysctl vm.swappiness=10
-  "; then
-    local new_swap
-    new_swap=$(free -m | awk '/^Swap:/{print $2}')
-    echo "✓ Готово: Swap настроен: ${new_swap}MB, Swappiness: 10"
-    log_action "Настроен swap: ${swap_size_mb}MB"
-  fi
-}
-
-# --- Шаг 6/10: Базовые компоненты + Docker/compose ---
+# --- Шаг 4: Базовые компоненты + Docker/compose ---
 step_components() {
   cls
-  print_header "Шаг 6/13 — Базовые компоненты и Docker"
-  
-  if ! ask_yesno "Установить базовые утилиты и Docker + compose-plugin?" "y"; then
+  if ! yesno "Шаг 4/8 — Компоненты" "Установить базовые утилиты (curl, git, htop и т.п.)\nи Docker + docker compose plugin?"; then
     return 0
   fi
 
-  if retry_on_error "Установка базовых пакетов" spinner "Ставлю базовые пакеты" bash -c "
+  spinner "Ставлю базовые пакеты" bash -c "
     apt-get update -y
     DEBIAN_FRONTEND=noninteractive apt-get install -y \
       ca-certificates curl gnupg lsb-release git htop wget unzip jq \
       software-properties-common apt-transport-https
-  "; then
-    if retry_on_error "Установка Docker" spinner "Устанавливаю Docker" bash -c "
-      curl -fsSL https://get.docker.com | sh
-      systemctl enable --now docker
-    "; then
-      spinner "Устанавливаю docker compose plugin" bash -c "
-        DEBIAN_FRONTEND=noninteractive apt-get install -y docker-compose-plugin || true
-      "
-      echo "✓ Готово: Базовые утилиты и Docker установлены."
-    fi
-  fi
+  "
+
+  # Docker через официальный скрипт (как ты делаешь)
+  spinner "Устанавливаю Docker" bash -c "
+    curl -fsSL https://get.docker.com | sh
+    systemctl enable --now docker
+  "
+
+  # compose-plugin
+  spinner "Устанавливаю docker compose plugin" bash -c "
+    DEBIAN_FRONTEND=noninteractive apt-get install -y docker-compose-plugin || true
+  "
+
+  info_box "Готово" "Установлены базовые утилиты и Docker (+compose plugin)."
 }
 
-# --- Шаг 7/10: Fail2Ban (базовая защита SSH) ---
-step_fail2ban_basic() {
-  cls
-  print_header "Шаг 7/13 — Fail2Ban"
-  
-  if ! ask_yesno "Установить и включить базовую защиту SSH через fail2ban?" "y"; then
-    return 0
-  fi
-
-  # Определяем порт SSH из конфигурации
-  local ssh_port
-  ssh_port=$(awk '/^Port[[:space:]]+/ {print $2}' /etc/ssh/sshd_config | tail -n1)
-  [[ -z "$ssh_port" ]] && ssh_port=22
-
-  # Считаем текущий публичный IP (для whitelist), если получится
-  local pub_ip=""
-  pub_ip=$(curl -fsS4 https://api.ipify.org || curl -fsS4 https://ifconfig.me || true)
-  local ignoreip_default="${pub_ip}"
-
-  echo "Автодетект IP: ${ignoreip_default:-нет}"
-  ask_input "Whitelist (ignoreip) - адреса/сети через пробел (доверенные IP), можно оставить пустым" "$ignoreip_default" "ignoreip"
-  ask_input "Время бана (напр., 1h, 12h, 1d)" "1h" "bantime"
-  if ! validate_time_format "$bantime"; then
-    echo "⚠ Неверный формат времени бана. Используется значение по умолчанию: 1h"
-    bantime="1h"
-  fi
-  ask_input "Окно анализа попыток (напр., 10m, 15m)" "10m" "findtime"
-  if ! validate_time_format "$findtime"; then
-    echo "⚠ Неверный формат времени окна. Используется значение по умолчанию: 10m"
-    findtime="10m"
-  fi
-  ask_input "Допустимо неудачных попыток до бана" "3" "maxretry"
-  if ! [[ "$maxretry" =~ ^[0-9]+$ ]] || (( maxretry < 1 || maxretry > 10 )); then
-    echo "⚠ Неверное значение maxretry (1-10). Используется значение по умолчанию: 3"
-    maxretry="3"
-  fi
-
-  if retry_on_error "Установка fail2ban" spinner "Устанавливаю и настраиваю fail2ban" bash -c "
-    DEBIAN_FRONTEND=noninteractive apt-get install -y fail2ban
-    systemctl enable --now fail2ban
-
-    backup_file /etc/fail2ban/jail.local
-
-    cat >/etc/fail2ban/jail.local <<'EOF'
-[DEFAULT]
-ignoreip = 127.0.0.1/8 ::1 ${ignoreip}
-bantime  = ${bantime}
-findtime = ${findtime}
-maxretry = ${maxretry}
-backend  = systemd
-
-[sshd]
-enabled  = true
-port     = ${ssh_port}
-filter   = sshd
-# backend=systemd позволяет читать journal без пути к logpath
-EOF
-
-    systemctl restart fail2ban
-  "; then
-    sleep 2
-    check_service_status fail2ban
-    local jail_status; jail_status=$(fail2ban-client status sshd 2>/dev/null || echo "Тюрьма sshd ещё не активна")
-    echo "✓ Готово: Fail2Ban установлено и включено."
-    echo "  Порт SSH: ${ssh_port}"
-    echo "  Статус: ${jail_status}"
-  fi
-}
-
-# --- Шаг 8/10: Автообновления (robust) ---
+# --- Шаг 5: Автообновления безопасности (unattended-upgrades) ---
 step_unattended() {
   cls
-  print_header "Шаг 8/13 — Автообновления"
-  
-  if ! ask_yesno "Включить unattended-upgrades (безопасность + обычные обновления)?" "y"; then
+  if ! yesno "Шаг 5/8 — Автообновления" "Включить unattended-upgrades для безопасности и системы?"; then
     return 0
   fi
 
-  if retry_on_error "Настройка автообновлений" spinner "Настраиваю unattended-upgrades и таймеры" bash -c '
-    set -e
-
-    # 1) Пакет
-    DEBIAN_FRONTEND=noninteractive apt-get update -y
+  spinner "Настраиваю unattended-upgrades" bash -c "
     DEBIAN_FRONTEND=noninteractive apt-get install -y unattended-upgrades
+    dpkg-reconfigure -fnoninteractive unattended-upgrades
 
-    # 2) Периодика APT — создаём 20auto-upgrades с нужными ключами
-    cat >/etc/apt/apt.conf.d/20auto-upgrades <<'"'"'CFG'"'"'
+    # Чаще проверять (ежедневно)
+    cat >/etc/apt/apt.conf.d/20auto-upgrades <<'CFG'
 APT::Periodic::Update-Package-Lists "1";
-APT::Periodic::Download-Upgradeable-Packages "1";
 APT::Periodic::Unattended-Upgrade "1";
-APT::Periodic::AutocleanInterval "7";
 CFG
-
-    # 3) Политика: ставим security + updates (не только security)
-    . /etc/os-release || true
-    CODENAME="${VERSION_CODENAME:-$(lsb_release -sc 2>/dev/null || echo stable)}"
-
-    cat >/etc/apt/apt.conf.d/51unattended-upgrades <<EOF
-Unattended-Upgrade::Origins-Pattern {
-        "origin=Ubuntu,archive=\${distro_codename}-security";
-        "origin=Ubuntu,archive=\${distro_codename}-updates";
-};
-// очищать зависимости, но не перезагружать автоматически
-Unattended-Upgrade::Remove-Unused-Dependencies "true";
-Unattended-Upgrade::Automatic-Reboot "false";
-EOF
-
-    # 4) Размаскируем и включим таймеры APT
-    systemctl unmask apt-daily.service apt-daily.timer apt-daily-upgrade.service apt-daily-upgrade.timer || true
-    systemctl enable --now apt-daily.timer apt-daily-upgrade.timer
-
-    # 5) Перезапустим таймеры (на всякий)
-    systemctl restart apt-daily.timer apt-daily-upgrade.timer
-
-    # 6) Немедленно обновим индексы, чтобы всё поехало
-    apt-get update -y
-  '; then
-    local t1 t2
-    t1=$(systemctl is-enabled apt-daily.timer 2>/dev/null || true)
-    t2=$(systemctl is-enabled apt-daily-upgrade.timer 2>/dev/null || true)
-    echo "✓ Готово: unattended-upgrades включён."
-    echo "  apt-daily.timer: ${t1}"
-    echo "  apt-daily-upgrade.timer: ${t2}"
-  fi
+    systemctl restart unattended-upgrades || true
+  "
+  info_box "Готово" "Автообновления включены."
 }
 
-# --- Шаг 9/10: journald (лимиты + 4 месяца) ---
+# --- Шаг 6: journald: лимиты + вакуум старше 4 месяцев ---
 step_journald_limits() {
   cls
-  print_header "Шаг 9/13 — Логи journald"
-  
-  if ! ask_yesno "Ограничить размер журналов и хранить не более 4 месяцев?" "y"; then
+  if ! yesno "Шаг 6/8 — Логи journald" "Ограничить размер журналов и хранить не более 4 месяцев?"; then
     return 0
   fi
-  
-  ask_input "Лимит journald SystemMaxUse (например, 500M или 1G)" "500M" "max_use"
-  if ! validate_size_format "$max_use"; then
-    echo "⚠ Неверный формат размера. Используется значение по умолчанию: 500M"
-    max_use="500M"
-  fi
 
-  if retry_on_error "Настройка journald" spinner "Настраиваю journald" bash -c "
+  # Спросим желаемый общий лимит (по-умолчанию 500M)
+  local max_use
+  max_use=$(input_box "Лимит journald" "SystemMaxUse (например, 500M или 1G):" "500M") || return 0
+
+  spinner "Настраиваю journald и vacuum-политику" bash -c "
     backup_file /etc/systemd/journald.conf
     awk '
-      BEGIN{f1=0;f2=0}
-      /^#?SystemMaxUse=/ {print \"SystemMaxUse=$max_use\"; f1=1; next}
-      /^#?SystemMaxFileSize=/ {print \"SystemMaxFileSize=50M\"; f2=1; next}
+      BEGIN{found1=0;found2=0}
+      /^#?SystemMaxUse=/ {print \"SystemMaxUse=$max_use\"; found1=1; next}
+      /^#?SystemMaxFileSize=/ {print \"SystemMaxFileSize=50M\"; found2=1; next}
       {print}
       END{
-        if(f1==0) print \"SystemMaxUse=$max_use\";
-        if(f2==0) print \"SystemMaxFileSize=50M\";
+        if(found1==0) print \"SystemMaxUse=$max_use\";
+        if(found2==0) print \"SystemMaxFileSize=50M\";
       }
     ' /etc/systemd/journald.conf > /etc/systemd/journald.conf.new
     mv /etc/systemd/journald.conf.new /etc/systemd/journald.conf
+
     systemctl restart systemd-journald
+
+    # Крон: еженедельно удалять журналы старше 120 дней (≈4 мес)
     echo 'PATH=/usr/sbin:/usr/bin:/sbin:/bin
+# vacuum older than 120 days weekly
 0 3 * * 0 root /usr/bin/journalctl --vacuum-time=120d >/dev/null 2>&1' > /etc/cron.d/journald_vacuum_120d
-  "; then
-    echo "✓ Готово: Лимит: $max_use; хранение: 120 дней."
-  fi
+  "
+  info_box "Готово" "journald ограничен до $max_use; старше 120 дней — очищается еженедельно."
 }
 
-# --- Шаг 10/10: Кастомный MOTD (автоответ y) ---
+# --- Шаг 7: Кастомный MOTD (отключить стандартный, включить кастом) ---
 step_motd_custom() {
   cls
-  print_header "Шаг 10/13 — Кастомный MOTD"
-  
-  if ! ask_yesno "Отключить стандартный MOTD и поставить кастомный?" "y"; then
+  if ! yesno "Шаг 7/8 — MOTD" "Отключить стандартный MOTD и поставить кастомный (dashboard.sh)?"; then
     return 0
   fi
 
@@ -916,507 +287,43 @@ step_motd_custom() {
       backup_file /etc/update-motd.d
       chmod -x /etc/update-motd.d/* || true
     fi
+    # Статический /etc/motd не обязателен, но очистим
     : > /etc/motd
   "
-  if safe_remote_script "https://dignezzz.github.io/server/dashboard.sh" "Кастомный MOTD" "yes"; then
-    echo "✓ Готово: Кастомный MOTD установлен."
-  else
-    echo "❌ Ошибка: Не удалось установить кастомный MOTD. Проверьте логи: $LOG_FILE"
-  fi
+
+  spinner "Устанавливаю кастомный MOTD (dashboard.sh)" bash -c "
+    bash <(wget -qO- https://dignezzz.github.io/server/dashboard.sh)
+  "
+
+  info_box "Готово" "Стандартный MOTD отключён, кастомный установлен."
 }
 
-# --- Шаг 11/13: sysctl_opt.sh и unlimit_server.sh ---
-step_sysctl_unlimit() {
+# --- Шаг 8: Вывести ссылку/команду на BBR3 (без запуска) ---
+step_bbr3_link() {
   cls
-  print_header "Шаг 11/13 — Оптимизации системы"
-  
-  if ! ask_yesno "Запустить sysctl_opt.sh и unlimit_server.sh (рекомендуется)?" "y"; then
-    return 0
-  fi
-  
-  local success_count=0
-  
-  # Выполняем первый скрипт с полной защитой от завершения
-  echo "Выполняю sysctl_opt.sh..."
-  set +e
-  (
-    safe_remote_script "https://dignezzz.github.io/server/sysctl_opt.sh" "sysctl оптимизации"
-  ) && ((success_count++)) || true
-  set -e
-  
-  # Явная проверка, что мы все еще в основном скрипте
-  log_action "Проверка после sysctl_opt.sh: скрипт продолжает работу"
-  
-  # Явно продолжаем выполнение после первого скрипта
-  echo
-  echo "✓ Шаг 11 (часть 1) завершён. Продолжаю выполнение..."
-  echo
-  
-  # Выполняем второй скрипт с полной защитой от завершения
-  echo "Выполняю unlimit_server.sh..."
-  set +e
-  (
-    safe_remote_script "https://dignezzz.github.io/server/unlimit_server.sh" "unlimit оптимизации"
-  ) && ((success_count++)) || true
-  set -e
-  
-  # Явная проверка, что мы все еще в основном скрипте
-  log_action "Проверка после unlimit_server.sh: скрипт продолжает работу"
-  
-  # Явно продолжаем выполнение после второго скрипта
-  echo
-  echo "✓ Шаг 11 (часть 2) завершён. Продолжаю выполнение..."
-  echo
-  
-  if [[ $success_count -eq 2 ]]; then
-    echo "✓ Готово: Все оптимизации применены успешно."
-  elif [[ $success_count -eq 1 ]]; then
-    echo "⚠ Частично: Применена только часть оптимизаций. Проверьте логи: $LOG_FILE"
-  else
-    echo "❌ Ошибка: Не удалось применить оптимизации. Проверьте логи: $LOG_FILE"
-  fi
-  
-  # Явное сообщение о продолжении работы скрипта
-  echo
-  echo "═══════════════════════════════════════"
-  echo "Шаг 11 завершён. Скрипт продолжает работу..."
-  echo "Переход к шагу 12..."
-  echo "═══════════════════════════════════════"
-  sleep 2
-  
-  # Гарантируем возврат успешного кода, чтобы скрипт продолжал работу
-  return 0
+  # Просто показать команду (как просил) — без выполнения.
+  local cmd='bash <(curl -s https://raw.githubusercontent.com/opiran-club/VPS-Optimizer/main/bbrv3.sh --ipv4)'
+  whiptail --title "Шаг 8/8 — BBR3 (инфо)" --msgbox "Для установки BBR3 (не запускаю автоматически):\n\n$cmd\n\nСкопируй эту команду и выполни вручную при необходимости." 14 78
 }
 
-# --- Шаг 12/10: Дополнительные SSH настройки безопасности ---
-step_ssh_additional_hardening() {
-  cls
-  print_header "Шаг 12/13 — Дополнительные SSH настройки"
-  
-  if ! ask_yesno "Применить дополнительные настройки безопасности SSH?" "y"; then
-    return 0
-  fi
-  
-  if retry_on_error "Дополнительные SSH настройки" spinner "Применяю дополнительные SSH настройки" bash -c "
-    backup_file /etc/ssh/sshd_config
-    
-    # Отключаем X11 forwarding
-    sed -i 's/^#\\?X11Forwarding .*/X11Forwarding no/' /etc/ssh/sshd_config
-    grep -q '^X11Forwarding ' /etc/ssh/sshd_config || echo 'X11Forwarding no' >> /etc/ssh/sshd_config
-    
-    # Отключаем UseDNS для ускорения подключения
-    sed -i 's/^#\\?UseDNS .*/UseDNS no/' /etc/ssh/sshd_config
-    grep -q '^UseDNS ' /etc/ssh/sshd_config || echo 'UseDNS no' >> /etc/ssh/sshd_config
-    
-    # Включаем TCPKeepAlive
-    sed -i 's/^#\\?TCPKeepAlive .*/TCPKeepAlive yes/' /etc/ssh/sshd_config
-    grep -q '^TCPKeepAlive ' /etc/ssh/sshd_config || echo 'TCPKeepAlive yes' >> /etc/ssh/sshd_config
-    
-    # Отключаем PermitEmptyPasswords
-    sed -i 's/^#\\?PermitEmptyPasswords .*/PermitEmptyPasswords no/' /etc/ssh/sshd_config
-    grep -q '^PermitEmptyPasswords ' /etc/ssh/sshd_config || echo 'PermitEmptyPasswords no' >> /etc/ssh/sshd_config
-    
-    # Устанавливаем ClientAliveInterval и ClientAliveCountMax
-    sed -i 's/^#\\?ClientAliveInterval .*/ClientAliveInterval 300/' /etc/ssh/sshd_config
-    grep -q '^ClientAliveInterval ' /etc/ssh/sshd_config || echo 'ClientAliveInterval 300' >> /etc/ssh/sshd_config
-    
-    sed -i 's/^#\\?ClientAliveCountMax .*/ClientAliveCountMax 2/' /etc/ssh/sshd_config
-    grep -q '^ClientAliveCountMax ' /etc/ssh/sshd_config || echo 'ClientAliveCountMax 2' >> /etc/ssh/sshd_config
-  "; then
-    apply_and_restart_sshd_safely
-    echo "✓ Готово: Дополнительные SSH настройки применены:"
-    echo "  - X11Forwarding: no"
-    echo "  - UseDNS: no"
-    echo "  - TCPKeepAlive: yes"
-    echo "  - ClientAliveInterval: 300"
-    log_action "Применены дополнительные SSH настройки безопасности"
-  fi
-}
-
-# --- Функция проверки целостности системы ---
-check_system_integrity() {
-  log_action "Проверка целостности системы после установки"
-  local issues=()
-  local warnings=()
-  
-  # Проверка критических сервисов
-  local critical_services=("ssh" "sshd" "docker" "fail2ban")
-  for service in "${critical_services[@]}"; do
-    if systemctl list-unit-files | grep -q "^${service}"; then
-      if ! systemctl is-active --quiet "$service" 2>/dev/null; then
-        issues+=("Сервис $service не активен")
-      fi
-    fi
-  done
-  
-  # Проверка SSH конфигурации
-  if ! sshd -t -f /etc/ssh/sshd_config 2>/dev/null; then
-    issues+=("Ошибка в конфигурации SSH")
-  fi
-  
-  # Проверка swap
-  local swap_total
-  swap_total=$(free -m | awk '/^Swap:/{print $2}')
-  if [[ $swap_total -eq 0 ]]; then
-    warnings+=("Swap не настроен (может быть нормально)")
-  fi
-  
-  # Проверка места на диске после установки
-  local available_space
-  available_space=$(df / | tail -1 | awk '{print $4}')
-  if [[ $available_space -lt 1048576 ]]; then # 1GB в KB
-    warnings+=("Мало места на диске: менее 1GB свободно")
-  fi
-  
-  # Формируем отчёт
-  local report="Проверка завершена.\n\n"
-  if [[ ${#issues[@]} -eq 0 ]] && [[ ${#warnings[@]} -eq 0 ]]; then
-    report+="✓ Все проверки пройдены успешно."
-  else
-    if [[ ${#issues[@]} -gt 0 ]]; then
-      report+="ОШИБКИ:\n"
-      for issue in "${issues[@]}"; do
-        report+="✗ $issue\n"
-      done
-      report+="\n"
-    fi
-    if [[ ${#warnings[@]} -gt 0 ]]; then
-      report+="ПРЕДУПРЕЖДЕНИЯ:\n"
-      for warning in "${warnings[@]}"; do
-        report+="⚠ $warning\n"
-      done
-    fi
-  fi
-  
-  log_action "Проверка целостности: ${#issues[@]} ошибок, ${#warnings[@]} предупреждений"
-  cls
-  print_header "Проверка целостности системы"
-  
-  # Показываем отчёт через whiptail или терминал
-  if command -v whiptail >/dev/null 2>&1; then
-    whiptail --title "Проверка целостности системы" --msgbox "$report" 20 80
-  else
-    echo -e "$report"
-    echo
-    read -p "Нажмите Enter для продолжения..."
-  fi
-  
-  return ${#issues[@]}
-}
-
-# Функция выбора начального шага через whiptail
-select_start_step() {
-  local start_step=0
-  
-  # Проверяем доступность whiptail
-  if command -v whiptail >/dev/null 2>&1; then
-    start_step=$(whiptail --title "Выбор начального шага" \
-      --menu "Выберите с какого шага начать выполнение:" \
-      20 60 14 \
-      "0" "Выполнить все шаги с начала" \
-      "1" "Hostname и часовой пояс" \
-      "2" "Настройка SSH" \
-      "3" "Создание sudo-пользователя" \
-      "4" "Обновление системы" \
-      "5" "Настройка swap" \
-      "6" "Базовые компоненты и Docker" \
-      "7" "Fail2Ban" \
-      "8" "Автообновления" \
-      "9" "Логи journald" \
-      "10" "Кастомный MOTD" \
-      "11" "Оптимизации системы" \
-      "12" "Дополнительные SSH настройки" \
-      "13" "Установка BBR3" \
-      3>&1 1>&2 2>&3)
-    
-    # Если пользователь нажал Cancel или ESC, используем значение по умолчанию (0)
-    if [[ $? -ne 0 ]] || [[ -z "$start_step" ]]; then
-      start_step=0
-    fi
-  else
-    # Fallback на терминальный ввод если whiptail недоступен
-    cls
-    print_header "Выбор начального шага"
-    echo "Выберите с какого шага начать выполнение:"
-    echo
-    echo "  1) Hostname и часовой пояс"
-    echo "  2) Настройка SSH"
-    echo "  3) Создание sudo-пользователя"
-    echo "  4) Обновление системы"
-    echo "  5) Настройка swap"
-    echo "  6) Базовые компоненты и Docker"
-    echo "  7) Fail2Ban"
-    echo "  8) Автообновления"
-    echo "  9) Логи journald"
-    echo " 10) Кастомный MOTD"
-    echo " 11) Оптимизации системы"
-    echo " 12) Дополнительные SSH настройки"
-    echo " 13) Установка BBR3"
-    echo
-    echo "  0) Выполнить все шаги с начала"
-    echo
-    
-    while true; do
-      echo -n "Введите номер шага (0-13) [0]: "
-      set +e
-      read -r start_step
-      set -e
-      
-      [[ -z "$start_step" ]] && start_step=0
-      
-      if [[ "$start_step" =~ ^[0-9]+$ ]] && (( start_step >= 0 && start_step <= 13 )); then
-        break
-      else
-        echo "⚠ Неверный номер. Введите число от 0 до 13."
-      fi
-    done
-  fi
-  
-  # Преобразуем в число
-  start_step=$((start_step + 0))
-  
-  echo "$start_step"
-  return 0
-}
-
-# --- Шаг 13/13: Установка BBR3 ---
-step_bbr3_install() {
-  cls
-  print_header "Шаг 13/13 — Установка BBR3"
-  echo "Установщик BBR3 будет запущен в интерактивном режиме."
-  echo "После завершения установки скрипт продолжит работу."
-  echo
-  
-  if ! ask_yesno "Запустить установку BBR3 сейчас?" "y"; then
-    return 0
-  fi
-
-  cls
-  echo -e "\n▶ Запускаю установщик BBR3...\n"
-  echo "⚠ Установщик работает в интерактивном режиме."
-  echo "   После завершения установки скрипт продолжится.\n"
-  log_action "Запуск установщика BBR3"
-  
-  # Проверяем подключение к интернету
-  if ! check_internet; then
-    log_action "ОШИБКА: Нет подключения к интернету для установки BBR3"
-    echo "❌ Ошибка: Нет подключения к интернету. Пропуск установки BBR3."
-    return 1
-  fi
-  
-  # Загружаем скрипт BBR3
-  local script_content
-  script_content=$(curl -fsS4 https://raw.githubusercontent.com/opiran-club/VPS-Optimizer/main/bbrv3.sh 2>&1)
-  if [[ $? -ne 0 ]] || [[ -z "$script_content" ]]; then
-    log_action "ОШИБКА: Не удалось загрузить установщик BBR3"
-    echo "❌ Ошибка: Не удалось загрузить установщик BBR3. Проверьте подключение к интернету."
-    return 1
-  fi
-  
-  # Сохраняем скрипт во временный файл
-  local tmp_script="/tmp/bbr3_installer_$(date +%s).sh"
-  echo "$script_content" > "$tmp_script"
-  chmod +x "$tmp_script"
-  log_action "Скрипт BBR3 сохранён: $tmp_script"
-  
-  # Выполняем BBR3 в подпроцессе с защитой от завершения основного скрипта
-  # Важно: выполняем напрямую для интерактивности, но в подпроцессе чтобы exit из BBR3 не завершал основной скрипт
-  local rc=0
-  
-  # Выполняем в подпроцессе - это защищает основной скрипт от exit из BBR3
-  # Выполняем напрямую без перенаправления для сохранения интерактивности
-  set +e
-  (
-    # Подпроцесс выполнит скрипт и завершится, но это не завершит основной скрипт
-    bash "$tmp_script" --ipv4
-    exit $?
-  ) || rc=$?
-  set -e
-  
-  # Очищаем временный файл
-  rm -f "$tmp_script"
-  
-  echo
-  if [[ $rc -eq 0 ]]; then
-    echo "✓ Установка BBR3 завершена успешно"
-    log_action "Установка BBR3 завершена успешно"
-  else
-    echo "⚠ Установка BBR3 завершена с кодом $rc"
-    log_action "Установка BBR3 завершена с кодом $rc"
-  fi
-  
-  echo
-  echo "Скрипт продолжает работу..."
-  sleep 2
-  
-  return $rc
-}
-
+# --- Основной поток ---
 main() {
   require_root
-  
-  # Устанавливаем обработчик Ctrl+C - требуется 3 нажатия для завершения
-  trap 'handle_ctrl_c' INT
-  
-  # Проверяем и устанавливаем whiptail для интерактивных окон
-  if ! command -v whiptail >/dev/null 2>&1; then
-    log_action "Установка whiptail для интерактивных окон"
-    set +e
-    apt-get update -qq >/dev/null 2>&1
-    apt-get install -y whiptail >/dev/null 2>&1
-    set -e
-  fi
-  
-  init_logging
-  init_backup_dir
-  log_action "Инициализация: логи в $LOG_FILE, резервные копии в $BACKUP_DIR"
-  
-  cls
-  print_header "Мастер настройки Ubuntu Server"
-  echo "Интерактивный мастер. После каждого шага — очистка экрана."
-  echo "Логи: $LOG_FILE"
-  echo "Резервные копии: $BACKUP_DIR"
-  echo
-  echo "⚠ Защита от случайного завершения: для остановки скрипта нажмите Ctrl+C 3 раза"
-  echo
-  
-  # Выбор начального шага
-  local start_step=""
-  set +e
-  start_step=$(select_start_step)
-  set -e
-  
-  # Если функция не вернула значение, используем значение по умолчанию
-  if [[ -z "$start_step" ]]; then
-    start_step=0
-  fi
-  
-  # Преобразуем в число
-  start_step=$((start_step + 0))
-  
-  # Показываем сообщение о выбранном шаге
-  if [[ $start_step -eq 0 ]]; then
-    if command -v whiptail >/dev/null 2>&1; then
-      whiptail --title "Готов к запуску" --msgbox "Выполнение всех шагов с начала.\n\nНажмите OK для продолжения." 10 60
-    else
-      echo "Выполнение всех шагов с начала."
-      echo
-      set +e
-      read -p "Нажмите Enter для продолжения..."
-      set -e
-    fi
-  else
-    if command -v whiptail >/dev/null 2>&1; then
-      whiptail --title "Готов к запуску" --msgbox "Начинаю выполнение с шага $start_step.\n\nНажмите OK для продолжения." 10 60
-    else
-      echo "Начинаю выполнение с шага $start_step."
-      echo
-      set +e
-      read -p "Нажмите Enter для продолжения..."
-      set -e
-    fi
-  fi
-  
-  # Проверка интернета (предупреждение, но не блокируем)
-  if ! check_internet; then
-    log_action "ПРЕДУПРЕЖДЕНИЕ: Нет подключения к интернету, некоторые шаги могут не работать"
-    echo
-    print_header "⚠ ПРЕДУПРЕЖДЕНИЕ"
-    echo "Обнаружены проблемы с подключением к интернету."
-    if ! ask_yesno "Продолжить выполнение?" "y"; then
-      log_action "Пользователь отменил выполнение из-за отсутствия интернета"
-      exit 0
-    fi
-  fi
+  install_whiptail
 
-  # Проверка системных требований (только если начинаем с начала)
-  if [[ $start_step -le 1 ]]; then
-    check_system_prerequisites
-  fi
-  
-  log_action "Начало выполнения шагов мастера с шага $start_step"
-  
-  # Выполняем шаги в зависимости от выбранного начального шага
-  if [[ $start_step -le 1 ]]; then
-    step_hostname_tz;            cls
-  fi
-  if [[ $start_step -le 2 ]]; then
-    step_ssh_hardening;          cls
-  fi
-  if [[ $start_step -le 3 ]]; then
-    step_create_user;            cls
-  fi
-  if [[ $start_step -le 4 ]]; then
-    step_updates_now;            cls
-  fi
-  if [[ $start_step -le 5 ]]; then
-    step_configure_swap;         cls
-  fi
-  if [[ $start_step -le 6 ]]; then
-    step_components;             cls
-  fi
-  if [[ $start_step -le 7 ]]; then
-    step_fail2ban_basic;         cls
-  fi
-  if [[ $start_step -le 8 ]]; then
-    step_unattended;             cls
-  fi
-  if [[ $start_step -le 9 ]]; then
-    step_journald_limits;        cls
-  fi
-  if [[ $start_step -le 10 ]]; then
-    step_motd_custom;            cls
-  fi
-  if [[ $start_step -le 11 ]]; then
-    # Шаг 11 выполняется с дополнительной защитой от завершения
-    set +e
-    step_sysctl_unlimit || true
-    set -e
-    cls
-  fi
-  if [[ $start_step -le 12 ]]; then
-    step_ssh_additional_hardening; cls
-  fi
-  
-  # Проверка целостности перед завершением (только если не пропустили шаги)
-  if [[ $start_step -le 12 ]]; then
-    check_system_integrity
-  fi
-  
-  if [[ $start_step -le 13 ]]; then
-    step_bbr3_install
-  fi
-  
-  log_action "=== Завершение autosettings.sh $(date) ==="
-  local duration=$(( $(date +%s) - SCRIPT_START_TIME ))
+  info_box "Мастер настройки" "Запускаю интерактивный мастер. После каждого шага — очистка экрана."
+
+  step_hostname_tz;  cls
+  step_ssh_hardening; cls
+  step_updates_now;   cls
+  step_components;    cls
+  step_unattended;    cls
+  step_journald_limits; cls
+  step_motd_custom;   cls
+  step_bbr3_link;     cls
+
+  info_box "Готово" "Базовая настройка завершена.\nМожно закрыть окно и продолжить работу."
   cls
-  print_header "Завершено"
-  echo "Все шаги выполнены."
-  echo "Время выполнения: ${duration} сек"
-  echo "Логи: $LOG_FILE"
-  echo
-  
-  # Предложение перезагрузки сервера
-  echo "═══════════════════════════════════════"
-  echo "Рекомендуется перезагрузить сервер для применения всех изменений."
-  echo "Особенно важно после установки BBR3."
-  echo "═══════════════════════════════════════"
-  echo
-  
-  if ask_yesno "Перезагрузить сервер сейчас?" "n"; then
-    log_action "Пользователь запросил перезагрузку сервера"
-    echo
-    echo "▶ Выполняется перезагрузка через 5 секунд..."
-    echo "   (Нажмите Ctrl+C для отмены)"
-    sleep 5
-    log_action "Перезагрузка сервера..."
-    reboot
-  else
-    echo
-    echo "Перезагрузка отменена. Вы можете перезагрузить сервер позже командой:"
-    echo "  sudo reboot"
-    echo
-  fi
 }
 
 main "$@"
